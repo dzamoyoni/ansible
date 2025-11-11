@@ -1,0 +1,29 @@
+---
+# RHEL/CentOS/Rocky Linux specific variables
+os_specific:
+  package_manager: "yum"
+  update_command: "yum makecache"
+  install_command: "yum install -y"
+  repository_path: "/etc/yum.repos.d"
+  firewall_service: "firewalld" 
+  time_service: "chronyd"
+  
+docker_packages:
+  - docker-ce-24.0.7-1.el8
+  - docker-ce-cli-24.0.7-1.el8
+  - containerd.io-1.6.24-3.1.el8
+  - docker-buildx-plugin-0.11.2-1.el8
+  - docker-compose-plugin-2.21.0-1.el8
+  
+# Alternative: Use base package names (yum will use repo priority)
+docker_packages_flexible:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+kubernetes_packages:
+  - kubelet
+  - kubeadm
+  - kubectl

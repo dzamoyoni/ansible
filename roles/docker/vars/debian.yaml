@@ -1,0 +1,32 @@
+---
+# Docker variables for Debian/Ubuntu systems
+
+docker:
+  repo_arch: "amd64"
+  pin_versions: false  # Set to true if you want specific versions
+  log_driver: "json-file"
+  log_max_size: "100m"
+  log_max_file: "3"
+  storage_driver: "overlay2"
+
+# Docker packages - flexible versions (will install latest)
+docker_packages_flexible:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# Docker packages - pinned versions (uncomment if pin_versions: true)
+docker_packages:
+  - docker-ce
+  - docker-ce-cli
+  - containerd.io
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+# CRI-dockerd configuration
+cri_dockerd:
+  version: "0.3.15"
+  debian_package: "cri-dockerd_0.3.15.3-0.debian-bookworm_amd64.deb"
+  rhel_package: "cri-dockerd-0.3.15.3-0.el8.x86_64.rpm"

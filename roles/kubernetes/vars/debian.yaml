@@ -1,0 +1,7 @@
+---
+# Kubernetes variables for Debian/Ubuntu systems
+
+kubernetes_packages:
+  - kubelet
+  - kubeadm
+  - kubectl

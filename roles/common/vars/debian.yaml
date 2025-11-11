@@ -1,0 +1,30 @@
+---
+# Debian/Ubuntu specific variables
+os_specific:
+  package_manager: "apt"
+  update_command: "apt update"
+  install_command: "apt install -y"
+  repository_keyring_path: "/etc/apt/keyrings"
+  repository_sources_path: "/etc/apt/sources.list.d"
+  firewall_service: "ufw"
+  time_service: "ntp"
+  
+docker_packages:
+  - docker-ce=5:24.0.7-1~ubuntu.22.04~jammy
+  - docker-ce-cli=5:24.0.7-1~ubuntu.22.04~jammy  
+  - containerd.io=1.6.24-1
+  - docker-buildx-plugin=0.11.2-1~ubuntu.22.04~jammy
+  - docker-compose-plugin=2.21.0-1~ubuntu.22.04~jammy
+  
+# Alternative: Use version ranges for flexibility
+docker_packages_flexible:
+  - "docker-ce>=5:24.0.0,<5:25.0.0"
+  - "docker-ce-cli>=5:24.0.0,<5:25.0.0"
+  - "containerd.io>=1.6.0,<1.7.0"
+  - docker-buildx-plugin
+  - docker-compose-plugin
+
+kubernetes_packages:
+  - kubelet
+  - kubeadm
+  - kubectl

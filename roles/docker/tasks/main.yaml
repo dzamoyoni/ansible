@@ -1,0 +1,246 @@
+---
+# ================================================================
+# Docker Installation Role with CRI-DOCKERD Support
+# Note: Configured exclusively for Docker + cri-dockerd as CRI.
+# ================================================================
+
+- name: Set OS-specific variables
+  include_vars: "{{ ansible_os_family | lower }}.yaml"
+
+# ================================================================
+# Check existing installation
+# ================================================================
+- name: Check if Docker is already installed
+  command: docker --version
+  register: docker_installed
+  failed_when: false
+  changed_when: false
+
+- name: Display current Docker status
+  debug:
+    msg: "Docker {{ 'is already installed' if docker_installed.rc == 0 else 'will be installed' }}"
+
+# ================================================================
+# Debian/Ubuntu Installation
+# ================================================================
+- name: Install Docker on Debian/Ubuntu
+  block:
+    - name: Create Docker keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key
+      ansible.builtin.get_url:
+        url: "https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}/gpg"
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        force: yes
+
+    - name: Add Docker APT repository
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        content: |
+          deb [arch={{ docker.repo_arch }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }} {{ ansible_lsb.codename }} stable
+        mode: '0644'
+      register: docker_repo_added
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+      when: docker_repo_added.changed
+
+    - name: Install Docker packages (pinned versions)
+      ansible.builtin.apt:
+        name: "{{ docker_packages }}"
+        state: present
+        allow_downgrade: yes
+      when: 
+        - docker_installed.rc != 0
+        - docker.pin_versions | default(true)
+        
+    - name: Install Docker packages (flexible versions)
+      ansible.builtin.apt:
+        name: "{{ docker_packages_flexible | default(docker_packages) }}"
+        state: present
+      when: 
+        - docker_installed.rc != 0
+        - not docker.pin_versions | default(true)
+  when: 
+    - ansible_os_family == "Debian"
+    - docker_installed.rc != 0
+
+# ================================================================
+# RHEL/CentOS/Rocky Installation
+# ================================================================
+- name: Install Docker on RHEL/CentOS/Rocky
+  block:
+    - name: Add Docker CE repository
+      ansible.builtin.yum_repository:
+        name: docker-ce-stable
+        description: Docker CE Stable - $basearch
+        baseurl: "https://download.docker.com/linux/centos/{{ ansible_distribution_major_version }}/$basearch/stable"
+        enabled: yes
+        gpgcheck: yes
+        gpgkey: https://download.docker.com/linux/centos/gpg
+
+    - name: Install Docker packages (pinned versions)
+      ansible.builtin.yum:
+        name: "{{ docker_packages }}"
+        state: present
+        allow_downgrade: yes
+      when: 
+        - docker_installed.rc != 0
+        - docker.pin_versions | default(true)
+        
+    - name: Install Docker packages (flexible versions)
+      ansible.builtin.yum:
+        name: "{{ docker_packages_flexible | default(docker_packages) }}"
+        state: present
+      when: 
+        - docker_installed.rc != 0
+        - not docker.pin_versions | default(true)
+  when: 
+    - ansible_os_family == "RedHat"
+    - docker_installed.rc != 0
+
+# ================================================================
+# CRI-dockerd Installation (Required for Kubernetes)
+# ================================================================
+- name: Check if cri-dockerd is installed
+  command: which cri-dockerd
+  register: cri_dockerd_installed
+  failed_when: false
+  changed_when: false
+
+- name: Install cri-dockerd (Debian/Ubuntu)
+  block:
+    - name: Download cri-dockerd deb package
+      ansible.builtin.get_url:
+        url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd.version }}/{{ cri_dockerd.debian_package }}"
+        dest: "/tmp/{{ cri_dockerd.debian_package }}"
+        mode: '0644'
+
+    - name: Install cri-dockerd package
+      ansible.builtin.apt:
+        deb: "/tmp/{{ cri_dockerd.debian_package }}"
+        update_cache: yes # Ensure dependencies are handled
+  when: 
+    - ansible_os_family == "Debian"
+    - cri_dockerd_installed.rc != 0
+
+- name: Install cri-dockerd (RHEL/CentOS/Rocky)
+  block:
+    - name: Download cri-dockerd rpm package
+      ansible.builtin.get_url:
+        url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd.version }}/{{ cri_dockerd.rhel_package }}"
+        dest: "/tmp/{{ cri_dockerd.rhel_package }}"
+        mode: '0644'
+
+    - name: Install cri-dockerd package
+      ansible.builtin.yum:
+        name: "/tmp/{{ cri_dockerd.rhel_package }}"
+        state: present
+        disable_gpg_check: yes
+  when: 
+    - ansible_os_family == "RedHat"
+    - cri_dockerd_installed.rc != 0
+
+# ================================================================
+# Configuration (Containerd blocks skipped)
+# ================================================================
+# Removed all 'Configure containerd' tasks as we use cri-dockerd
+
+- name: Create Docker daemon configuration directory
+  ansible.builtin.file:
+    path: /etc/docker
+    state: directory
+    mode: '0755'
+
+- name: Configure Docker daemon
+  ansible.builtin.copy:
+    content: |
+      {
+        "exec-opts": ["native.cgroupdriver=systemd"],
+        "log-driver": "{{ docker.log_driver }}",
+        "log-opts": {
+          "max-size": "{{ docker.log_max_size }}",
+          "max-file": "{{ docker.log_max_file }}"
+        },
+        "storage-driver": "{{ docker.storage_driver }}"
+      }
+    dest: /etc/docker/daemon.json
+    mode: '0644'
+  register: docker_daemon_config
+
+# ================================================================
+# Service Management
+# ================================================================
+- name: Reload systemd daemon (CRITICAL)
+  ansible.builtin.systemd:
+    daemon_reload: yes
+
+# Removed containerd service tasks
+
+- name: Restart Docker if daemon config changed
+  ansible.builtin.systemd:
+    name: docker
+    state: restarted
+    enabled: yes
+  when: docker_daemon_config.changed
+
+- name: Ensure Docker is started and enabled
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: yes
+
+- name: Enable and start cri-docker socket
+  ansible.builtin.systemd:
+    name: cri-docker.socket
+    state: started
+    enabled: yes
+    daemon_reload: yes # Ensures the service file is read after install/change
+
+- name: Enable and start cri-docker service
+  ansible.builtin.systemd:
+    name: cri-docker.service
+    state: started
+    enabled: yes
+
+- name: Add user to docker group
+  ansible.builtin.shell: usermod -aG docker {{ ansible_user }}
+  args:
+    executable: /bin/bash
+  register: docker_group_add
+  changed_when: docker_group_add.rc == 0
+  failed_when: false
+  when: ansible_user != 'root'
+
+# ================================================================
+# Verification
+# ================================================================
+- name: Wait for Docker socket to be available
+  ansible.builtin.wait_for:
+    path: /var/run/docker.sock
+    timeout: 30
+
+- name: Wait for cri-dockerd socket to be available (CRITICAL)
+  ansible.builtin.wait_for:
+    path: /var/run/cri-dockerd.sock
+    timeout: 30
+
+- name: Test Docker installation
+  ansible.builtin.command: docker run --rm hello-world
+  register: docker_test
+  changed_when: false
+  when: docker_installed.rc != 0
+
+- name: Display Docker test result
+  ansible.builtin.debug:
+    msg: "✓ Docker installation verified successfully"
+  when: 
+    - docker_test is defined
+    - docker_test.rc is defined
+    - docker_test.rc == 0

@@ -1,0 +1,230 @@
+---
+# ================================================================
+# Keepalived VIP Management for Stacked Control Plane HA
+# Based on: kubernetes/kubeadm HA considerations - Stacked topology
+# ================================================================
+
+- name: Set OS-specific variables
+  include_vars: "{{ ansible_os_family | lower }}.yaml"
+
+# ================================================================
+# Prerequisites Check
+# ================================================================
+- name: Check if running on control plane nodes
+  fail:
+    msg: "Keepalived should only be installed on control plane nodes"
+  when: inventory_hostname not in groups['k8s_load_balancers']
+
+- name: Check if virtual IP is reachable
+  command: ping -c 1 {{ k8s_vip }}
+  register: vip_ping
+  failed_when: false
+  changed_when: false
+
+- name: Display VIP status
+  debug:
+    msg: "Virtual IP {{ k8s_vip }} is {{ 'already in use' if vip_ping.rc == 0 else 'available' }}"
+
+# ================================================================
+# Install Keepalived (if not already installed)
+# ================================================================
+- name: Check if Keepalived is installed
+  command: which keepalived
+  register: keepalived_installed
+  failed_when: false
+  changed_when: false
+
+- name: Install Keepalived (Debian/Ubuntu)
+  apt:
+    name: keepalived
+    state: present
+    update_cache: yes
+  when: 
+    - ansible_os_family == "Debian"
+    - keepalived_installed.rc != 0
+
+- name: Install Keepalived (RHEL/CentOS/Rocky)
+  yum:
+    name: keepalived
+    state: present
+    update_cache: yes
+  when: 
+    - ansible_os_family == "RedHat"
+    - keepalived_installed.rc != 0
+
+# ================================================================
+# Stop system service (we'll use static pod instead)
+# ================================================================
+- name: Stop and disable system Keepalived service  
+  systemd:
+    name: keepalived
+    state: stopped
+    enabled: no
+  # ignore_errors: yes
+
+# ================================================================
+# Create static pod manifests directory
+# ================================================================
+- name: Create kubelet static pods directory
+  file:
+    path: /etc/kubernetes/manifests
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Create Keepalived configuration directory
+  file:
+    path: /etc/keepalived-k8s
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+
+# ================================================================
+# Generate Keepalived configuration
+# ================================================================
+- name: Generate Keepalived configuration
+  template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived-k8s/keepalived.conf
+    mode: '0644'
+    owner: root
+    group: root
+  register: keepalived_config
+
+- name: Create Keepalived health check script
+  copy:
+    content: |
+      #!/bin/bash
+      # Check if local kube-apiserver is responding
+      curl -k -s https://127.0.0.1:6443/healthz >/dev/null
+      exit $?
+    dest: /etc/keepalived-k8s/check_apiserver.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+# ================================================================
+# Create Keepalived static pod manifest  
+# ================================================================
+- name: Create Keepalived static pod manifest
+  template:
+    src: keepalived-static-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/keepalived.yaml
+    mode: '0644'
+    owner: root
+    group: root
+  register: keepalived_manifest
+
+# ================================================================
+# Create notification script
+# ================================================================
+- name: Create Keepalived notification script
+  copy:
+    content: |
+      #!/bin/bash
+      TYPE=$1
+      NAME=$2
+      STATE=$3
+      logger "Keepalived: $NAME transitioned to $STATE state"
+      
+      case $STATE in
+        "MASTER")
+          logger "Keepalived: This node is now MASTER - VIP {{ k8s_vip }} active"
+          ;;
+        "BACKUP")
+          logger "Keepalived: This node is now BACKUP - VIP released"
+          ;;
+        "FAULT")
+          logger "Keepalived: FAULT state - VIP health check failed"
+          ;;
+      esac
+    dest: /usr/local/bin/keepalived-notify.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+# ================================================================
+# Validation
+# ================================================================
+- name: Check if kubelet is running
+  command: systemctl is-active kubelet
+  register: kubelet_running
+  failed_when: false
+  changed_when: false
+  
+- name: Display static pod readiness note
+  debug:
+    msg:
+      - "Keepalived manifest created in /etc/kubernetes/manifests/"
+      - "Static pod will start automatically when kubelet is running"
+      - "VIP {{ k8s_vip }} will be managed by Keepalived"
+      - "No HAProxy needed - direct connection to API server on active control plane"
+
+- name: Display Keepalived configuration
+  debug:
+    msg:
+      - "Keepalived VIP Configuration Complete"
+      - "Virtual IP: {{ k8s_vip }}"
+      - "Interface: {{ k8s_vip_interface }}"
+      - "Keepalived state: {{ keepalived_state }}"
+      - "Keepalived priority: {{ keepalived_priority }}"
+      - "Architecture: Stacked Control Plane (VIP points directly to active API server)"
+
+# ================================================================
+# Health Check Script
+# ================================================================
+- name: Create VIP health check script
+  copy:
+    content: |
+      #!/bin/bash
+      # Keepalived VIP Health Check Script
+      
+      VIP="{{ k8s_vip }}"
+      PORT="6443"
+      
+      echo "=== Keepalived VIP Health Check ==="
+      echo "Date: $(date)"
+      echo
+      
+      # Check if VIP is assigned
+      if ip addr show | grep -q "$VIP"; then
+        echo "✓ Virtual IP $VIP is assigned to this node (MASTER)"
+      else
+        echo "✗ Virtual IP $VIP is NOT assigned to this node (BACKUP)"
+      fi
+      
+      # Check Keepalived process
+      if pgrep keepalived > /dev/null; then
+        echo "✓ Keepalived process is running"
+      else
+        echo "✗ Keepalived process is NOT running"
+      fi
+      
+      # Check local API server
+      if curl -k -s https://127.0.0.1:6443/healthz | grep -q ok; then
+        echo "✓ Local API server is healthy"
+      else
+        echo "✗ Local API server is NOT healthy"
+      fi
+      
+      # Test connection to VIP
+      if timeout 3 bash -c "echo >/dev/tcp/$VIP/$PORT" 2>/dev/null; then
+        echo "✓ Connection to $VIP:$PORT successful"
+      else
+        echo "✗ Connection to $VIP:$PORT failed"
+      fi
+      
+      echo
+      echo "=== Static Pod Status ==="
+      if command -v kubectl > /dev/null 2>&1 && [ -f /etc/kubernetes/admin.conf ]; then
+        export KUBECONFIG=/etc/kubernetes/admin.conf
+        kubectl get pods -n kube-system | grep keepalived || echo "No keepalived pods found"
+      else
+        echo "kubectl not available or cluster not initialized"
+      fi
+    dest: /usr/local/bin/vip-check.sh
+    mode: '0755'
+    owner: root
+    group: root

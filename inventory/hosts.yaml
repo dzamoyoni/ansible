@@ -1,0 +1,23 @@
+all:
+  vars:
+    ansible_user: djuma
+    # ansible_password:
+    ansible_python_interpreter: /usr/bin/python3
+    # ansible_become_pass: 
+  children:
+    k8s_control_plane:
+      hosts:
+        app01:
+          ansible_host: 192.168.102.240
+    # k8s_workers:
+    #   hosts:
+    #     app02:
+    #       ansible_host: 192.168.102.92
+        # app03:
+        #   ansible_host: 172.20.201.16
+
+          
+    k8s_nodes:
+      children:
+        k8s_control_plane:
+        k8s_workers:

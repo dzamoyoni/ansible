@@ -1,0 +1,755 @@
+---
+# =============================================================================
+# Kubernetes STACKED HA Cluster Deployment
+# =============================================================================
+
+- name: Record deployment start
+  hosts: localhost
+  gather_facts: yes
+  tasks:
+    - name: Record playbook start time
+      ansible.builtin.set_fact:
+        playbook_start_time: "{{ ansible_date_time.epoch }}"
+
+# =============================================================================
+# Phase 1 - 5 : validation, common, docker, kubernetes, preflight
+# =============================================================================
+- name: Phase 1 - Pre-flight validation
+  hosts: localhost
+  gather_facts: no
+  tags: ['validation']
+  tasks:
+    - name: Validate cluster configuration
+      ansible.builtin.assert:
+        that:
+          - groups['k8s_control_plane'] | length >= 1
+          - k8s_vip is defined and k8s_vip != ""
+          - kube_api_bind_port is defined
+          - kube_api_bind_port | int != haproxy_frontend_port | int
+        success_msg: "✓ Pre-flight validation passed"
+
+- name: Phase 2 - Common system preparation
+  hosts: k8s_cluster
+  become: true
+  gather_facts: yes
+  tags: ['common']
+  roles:
+    - common
+
+- name: Phase 3 - Install container runtime
+  hosts: k8s_cluster
+  become: true
+  gather_facts: yes
+  tags: ['docker']
+  tasks:
+    - name: Check existing Docker
+      ansible.builtin.command: docker info
+      register: docker_check
+      failed_when: false
+      changed_when: false
+    - name: Set Docker install flag
+      ansible.builtin.set_fact:
+        needs_docker_install: "{{ docker_check.rc != 0 }}"
+  roles:
+    - role: docker
+      when: needs_docker_install | default(true)
+
+- name: Phase 4 - Install Kubernetes
+  hosts: k8s_cluster
+  become: true
+  gather_facts: yes
+  any_errors_fatal: true
+  tags: ['kubernetes']
+  roles:
+    - kubernetes
+
+- name: Phase 5 - Validate prerequisites
+  hosts: k8s_cluster
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: true
+  tags: ['preflight']
+  tasks:
+    - name: Check for CRI socket
+      ansible.builtin.stat:
+        path: /var/run/cri-dockerd.sock
+      register: cri_socket
+    - name: Fail if CRI socket missing
+      ansible.builtin.fail:
+        msg: "CRI socket not found!"
+      when: not cri_socket.stat.exists
+
+# =============================================================================
+# Phase 6: Initialize FIRST Control Plane 
+# =============================================================================
+- name: Phase 6 - Initialize First Control Plane
+  hosts: "{{ groups['k8s_control_plane'][0] }}"
+  become: yes
+  gather_facts: yes
+  any_errors_fatal: true
+  tags: ['init']
+  vars:
+    kubeadm_config: /etc/kubernetes/kubeadm-config.yaml
+  tasks:
+    - name: Create /etc/kubernetes directory
+      ansible.builtin.file:
+        path: /etc/kubernetes
+        state: directory
+        mode: '0755'
+
+    - name: Build certificate SANs list
+      ansible.builtin.set_fact:
+        cert_sans_list: "{{ [k8s_vip] + (groups['k8s_control_plane'] | map('extract', hostvars, 'ansible_host') | list) + ['localhost', '127.0.0.1'] }}"
+
+    - name: Generate kubeadm configuration
+      ansible.builtin.template:
+        src: roles/kubeadm-init/templates/kubeadm-config.yaml.j2
+        dest: "{{ kubeadm_config }}"
+        mode: '0644'
+
+    - name: Check if cluster already initialized
+      ansible.builtin.stat:
+        path: /etc/kubernetes/admin.conf
+      register: cluster_exists
+
+    - name: Initialize Kubernetes cluster
+      ansible.builtin.command: /usr/bin/kubeadm init --config {{ kubeadm_config }} --upload-certs --v=5
+      register: kubeadm_init
+      when: not cluster_exists.stat.exists
+      timeout: 900
+
+    - name: Create .kube directory
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+
+    - name: Set up kubeconfig
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        mode: '0600'
+
+    - name: Wait for API server
+      ansible.builtin.command: kubectl get --raw /healthz
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: api_health
+      until: api_health.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Generate join commands
+      block:
+        - name: Get certificate key
+          ansible.builtin.shell: kubeadm init phase upload-certs --upload-certs 2>/dev/null | tail -1
+          register: cert_key
+          changed_when: false
+
+        - name: Generate control plane join command
+          ansible.builtin.shell: kubeadm token create --print-join-command
+          register: join_command_base
+          changed_when: false
+
+        - name: Build complete control plane join command
+          ansible.builtin.set_fact:
+            cp_join_command: "{{ join_command_base.stdout }} --control-plane --certificate-key {{ cert_key.stdout }} --cri-socket unix:///var/run/cri-dockerd.sock --apiserver-advertise-address={{ ansible_default_ipv4.address }}"
+
+        - name: Save control plane join command
+          ansible.builtin.copy:
+            dest: /root/cp-join-command.sh
+            content: |
+              #!/bin/bash
+              {{ cp_join_command }}
+            mode: '0755'
+
+        - name: Generate worker join command
+          ansible.builtin.command: kubeadm token create --print-join-command
+          register: worker_join_cmd
+          changed_when: false
+
+        - name: Build worker join command
+          ansible.builtin.set_fact:
+            worker_join_command: "{{ worker_join_cmd.stdout }} --cri-socket unix:///var/run/cri-dockerd.sock"
+
+        - name: Save worker join command
+          ansible.builtin.copy:
+            dest: /root/worker-join-command.sh
+            content: |
+              #!/bin/bash
+              {{ worker_join_command }}
+            mode: '0755'
+
+# =============================================================================
+# Phase 6.3: Deploy HAProxy/Keepalived Static Pods (After kubelet config exists)
+# =============================================================================
+- name: Phase 6.3 - Deploy HAProxy/Keepalived Static Pods
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  tags: ['lb', 'ha']
+  tasks:
+    - name: Check if kubelet is configured
+      ansible.builtin.stat:
+        path: /var/lib/kubelet/config.yaml
+      register: kubelet_config
+
+    - name: Skip if kubelet not configured
+      ansible.builtin.meta: end_host
+      when: not kubelet_config.stat.exists
+
+    - name: Create directories for static pod configs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/kubernetes/manifests
+        - /etc/kubernetes/haproxy
+        - /etc/kubernetes/keepalived
+        - /var/lib/haproxy
+
+    - name: Set Keepalived priority
+      ansible.builtin.set_fact:
+        keepalived_state: "{{ 'MASTER' if inventory_hostname == groups['k8s_control_plane'][0] else 'BACKUP' }}"
+        keepalived_priority: "{{ 110 if inventory_hostname == groups['k8s_control_plane'][0] else (100 - groups['k8s_control_plane'].index(inventory_hostname)) }}"
+
+    - name: Generate HAProxy configuration
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/haproxy.cfg.j2
+        dest: /etc/kubernetes/haproxy/haproxy.cfg
+        mode: '0644'
+
+    - name: Generate Keepalived configuration
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/keepalived.conf.j2
+        dest: /etc/kubernetes/keepalived/keepalived.conf
+        mode: '0644'
+
+    - name: Deploy HAProxy static pod manifest
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/haproxy-static-pod.yaml.j2
+        dest: /etc/kubernetes/manifests/haproxy-{{ inventory_hostname }}.yaml
+        mode: '0644'
+
+    - name: Deploy Keepalived static pod manifest
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/keepalived-static-pod.yaml.j2
+        dest: /etc/kubernetes/manifests/keepalived-{{ inventory_hostname }}.yaml
+        mode: '0644'
+
+    - name: Wait for static pods to start
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for kubelet to start static pods..."
+
+    - name: Verify HAProxy pod is running
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get pods -n kube-system | grep haproxy-{{ inventory_hostname }} | grep Running || echo "NOT_RUNNING"
+      register: haproxy_pod_check
+      until: "'Running' in haproxy_pod_check.stdout"
+      retries: 10
+      delay: 6
+      changed_when: false
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+
+    - name: Display HAProxy pod status
+      ansible.builtin.debug:
+        msg: "✓ HAProxy static pod is running on {{ inventory_hostname }}"
+
+# =============================================================================
+# Phase 6.5: Install CNI Plugin (Calico)
+# =============================================================================
+- name: Phase 6.5 - Install CNI Plugin
+  hosts: "{{ groups['k8s_control_plane'][0] }}"
+  become: true
+  gather_facts: no
+  tags: ['cni']
+  tasks:
+    - name: Check if Calico already installed
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get daemonset -n kube-system calico-node --no-headers 2>/dev/null | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_exists
+      changed_when: false
+      failed_when: false
+
+    - name: Apply Calico CNI manifest
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f https://docs.projectcalico.org/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_install
+      when: calico_exists.stdout | int == 0
+
+    - name: Display Calico installation status
+      ansible.builtin.debug:
+        msg: "✓ Calico CNI {{ 'installed' if calico_exists.stdout | int == 0 else 'already exists' }}"
+
+    - name: Wait for Calico DaemonSet to be created
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get daemonset calico-node --no-headers 2>/dev/null | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_ds
+      until: calico_ds.stdout | int > 0
+      retries: 15
+      delay: 5
+      changed_when: false
+
+    - name: Wait for Calico pods to be scheduled
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l k8s-app=calico-node --no-headers 2>/dev/null | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_pods_count
+      until: calico_pods_count.stdout | int > 0
+      retries: 5
+      delay: 10
+      changed_when: false
+
+    - name: Wait for Calico pods to be Running
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l k8s-app=calico-node --no-headers | awk '{if ($2 != "1/1" || $3 != "Running") print $1}' | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_not_ready
+      until: calico_not_ready.stdout | int == 0
+      retries: 5
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Check Calico node status
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l k8s-app=calico-node -o wide
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: calico_status
+      changed_when: false
+
+    - name: Display Calico status
+      ansible.builtin.debug:
+        msg: "{{ calico_status.stdout_lines }}"
+
+    - name: Wait for CoreDNS pods to be Running
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l k8s-app=kube-dns --no-headers | awk '{if ($2 != "1/1" || $3 != "Running") print $1}' | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: coredns_not_ready
+      until: coredns_not_ready.stdout | int == 0
+      retries: 6
+      delay: 10
+      changed_when: false
+      failed_when: false
+
+    - name: Check CoreDNS logs if not ready
+      ansible.builtin.shell: |
+        POD=$(kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system get pods -l k8s-app=kube-dns --no-headers -o custom-columns=":metadata.name" | head -1)
+        if [ -n "$POD" ]; then
+          kubectl --kubeconfig /etc/kubernetes/admin.conf -n kube-system logs $POD --tail=20 2>&1 || echo "Cannot fetch logs"
+        fi
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: coredns_logs
+      when: coredns_not_ready.stdout | int > 0
+      changed_when: false
+      failed_when: false
+
+    - name: Display CoreDNS logs if issues
+      ansible.builtin.debug:
+        msg: "CoreDNS logs: {{ coredns_logs.stdout_lines }}"
+      when: 
+        - coredns_not_ready.stdout | int > 0
+        - coredns_logs is defined
+
+# =============================================================================
+# Phase 6.6: Un-taint Control Plane Nodes
+# =============================================================================
+- name: Phase 6.6 - Un-taint Control Plane Nodes
+  hosts: "{{ groups['k8s_control_plane'][0] }}"
+  become: yes
+  gather_facts: no
+  tags: ['untaint']
+  tasks:
+    - name: Get all control plane nodes
+      ansible.builtin.shell: kubectl --kubeconfig /etc/kubernetes/admin.conf get nodes -l node-role.kubernetes.io/control-plane --no-headers -o custom-columns=":metadata.name"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: control_plane_nodes
+      changed_when: false
+
+    - name: Remove control-plane NoSchedule taint
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf taint node {{ item }} node-role.kubernetes.io/control-plane:NoSchedule- || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      loop: "{{ control_plane_nodes.stdout_lines }}"
+      register: untaint_result
+      changed_when: "'untainted' in untaint_result.stdout"
+      failed_when: false
+
+# =============================================================================
+# Phase 7: Join additional control planes
+# =============================================================================
+- name: Phase 7 - Join additional control-plane nodes
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  serial: 1
+  tags: ['join-cp']
+  tasks:
+    - name: Skip primary control plane
+      ansible.builtin.meta: end_host
+      when: inventory_hostname == groups['k8s_control_plane'][0]
+
+    - name: Check if already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: already_joined
+
+    - name: Display skip message if already joined
+      ansible.builtin.debug:
+        msg: "✓ Node {{ inventory_hostname }} already joined cluster, skipping..."
+      when: already_joined.stat.exists
+
+    - name: End if already joined
+      ansible.builtin.meta: end_host
+      when: already_joined.stat.exists
+
+    - name: Wait for primary control plane API to be ready
+      ansible.builtin.shell: |
+        timeout 5 bash -c "</dev/tcp/{{ hostvars[groups['k8s_control_plane'][0]].ansible_host }}/{{ kube_api_bind_port }}" && echo "OPEN" || echo "CLOSED"
+      register: api_port_check
+      until: "'OPEN' in api_port_check.stdout"
+      retries: 30
+      delay: 10
+      changed_when: false
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      when: not already_joined.stat.exists
+
+    - name: Fetch join command
+      ansible.builtin.slurp:
+        src: /root/cp-join-command.sh
+      register: cp_join_script
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      when: not already_joined.stat.exists
+
+    - name: Create join script
+      ansible.builtin.copy:
+        dest: /root/cp-join-command.sh
+        content: "{{ cp_join_script.content | b64decode }}"
+        mode: '0755'
+      when: not already_joined.stat.exists
+
+    - name: Display join attempt
+      ansible.builtin.debug:
+        msg: "Attempting to join {{ inventory_hostname }} to cluster..."
+      when: not already_joined.stat.exists
+
+    - name: Execute join
+      ansible.builtin.shell: /root/cp-join-command.sh 2>&1
+      register: cp_join_result
+      when: not already_joined.stat.exists
+      timeout: 600
+      failed_when: 
+        - cp_join_result.rc != 0
+        - "'This node has joined the cluster' not in cp_join_result.stdout"
+
+    - name: Display join result
+      ansible.builtin.debug:
+        msg: "{{ cp_join_result.stdout_lines | default([]) }}"
+      when: 
+        - not already_joined.stat.exists
+        - cp_join_result is defined
+
+    - name: Create .kube directory
+      ansible.builtin.file:
+        path: /root/.kube
+        state: directory
+        mode: '0755'
+      when: not already_joined.stat.exists
+
+    - name: Set up kubeconfig
+      ansible.builtin.copy:
+        remote_src: true
+        src: /etc/kubernetes/admin.conf
+        dest: /root/.kube/config
+        mode: '0600'
+      when: not already_joined.stat.exists
+
+    - name: Wait for node to be Ready
+      ansible.builtin.shell: |
+        kubectl --kubeconfig /etc/kubernetes/admin.conf get node {{ ansible_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}'
+      register: node_ready
+      until: node_ready.stdout == "True"
+      retries: 20
+      delay: 15
+      changed_when: false
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      when: not already_joined.stat.exists
+      failed_when: false
+
+# =============================================================================
+# Phase 7.5: Deploy HA components on newly joined control plane nodes
+# =============================================================================
+- name: Phase 7.5 - Deploy HA on additional control plane nodes
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  serial: 1
+  tags: ['join-cp', 'ha']
+  tasks:
+    - name: Skip primary control plane
+      ansible.builtin.meta: end_host
+      when: inventory_hostname == groups['k8s_control_plane'][0]
+
+    - name: Check if kubelet is running
+      ansible.builtin.systemd:
+        name: kubelet
+        state: started
+      register: kubelet_status
+      failed_when: false
+
+    - name: Skip if kubelet not running
+      ansible.builtin.meta: end_host
+      when: kubelet_status.status.ActiveState != "active"
+
+    - name: Create directories for static pod configs
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/kubernetes/manifests
+        - /etc/kubernetes/haproxy
+        - /etc/kubernetes/keepalived
+        - /var/lib/haproxy
+
+    - name: Set Keepalived priority
+      ansible.builtin.set_fact:
+        keepalived_state: "{{ 'MASTER' if inventory_hostname == groups['k8s_control_plane'][0] else 'BACKUP' }}"
+        keepalived_priority: "{{ 110 if inventory_hostname == groups['k8s_control_plane'][0] else (100 - groups['k8s_control_plane'].index(inventory_hostname)) }}"
+
+    - name: Generate HAProxy configuration
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/haproxy.cfg.j2
+        dest: /etc/kubernetes/haproxy/haproxy.cfg
+        mode: '0644'
+
+    - name: Generate Keepalived configuration
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/keepalived.conf.j2
+        dest: /etc/kubernetes/keepalived/keepalived.conf
+        mode: '0644'
+
+    - name: Deploy HAProxy static pod manifest
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/haproxy-static-pod.yaml.j2
+        dest: /etc/kubernetes/manifests/haproxy-{{ inventory_hostname }}.yaml
+        mode: '0644'
+
+    - name: Deploy Keepalived static pod manifest
+      ansible.builtin.template:
+        src: roles/haproxy-keepalived/templates/keepalived-static-pod.yaml.j2
+        dest: /etc/kubernetes/manifests/keepalived-{{ inventory_hostname }}.yaml
+        mode: '0644'
+
+    - name: Check if node is in etcd cluster
+      ansible.builtin.shell: |
+        docker exec $(docker ps | grep k8s_etcd | head -1 | awk '{print $1}') \
+        etcdctl --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        member list | grep {{ ansible_hostname }} || echo "MISSING"
+      register: etcd_check
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Fix missing etcd member (kubeadm join bug workaround)
+      block:
+        - name: Stop etcd pod on this node
+          ansible.builtin.shell: |
+            if [ -f /etc/kubernetes/manifests/etcd.yaml ]; then
+              mv /etc/kubernetes/manifests/etcd.yaml /tmp/etcd.yaml.bak
+              sleep 5
+            fi
+
+        - name: Remove stale etcd data
+          ansible.builtin.file:
+            path: /var/lib/etcd
+            state: absent
+
+        - name: Add node to etcd cluster
+          ansible.builtin.shell: |
+            docker exec $(docker ps | grep k8s_etcd | head -1 | awk '{print $1}') \
+            etcdctl --endpoints=https://127.0.0.1:2379 \
+            --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+            --cert=/etc/kubernetes/pki/etcd/server.crt \
+            --key=/etc/kubernetes/pki/etcd/server.key \
+            member add {{ ansible_hostname }} --peer-urls=https://{{ ansible_default_ipv4.address }}:2380
+          delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+          register: member_add_result
+
+        - name: Display member add result
+          ansible.builtin.debug:
+            msg: "✓ Added {{ ansible_hostname }} to etcd cluster"
+      when: "'MISSING' in etcd_check.stdout"
+
+    - name: Restore etcd manifest if it was moved
+      ansible.builtin.shell: |
+        if [ -f /tmp/etcd.yaml.bak ]; then
+          mv /tmp/etcd.yaml.bak /etc/kubernetes/manifests/etcd.yaml
+        fi
+      when: "'MISSING' in etcd_check.stdout"
+
+    - name: Get hostnames from all control plane nodes
+      ansible.builtin.shell: hostname
+      register: node_hostname
+      delegate_to: "{{ item }}"
+      loop: "{{ groups['k8s_control_plane'] }}"
+      when: ansible_default_ipv4.address != hostvars[groups['k8s_control_plane'][0]].ansible_host
+      changed_when: false
+
+    - name: Build etcd initial-cluster parameter with all members
+      ansible.builtin.set_fact:
+        etcd_initial_cluster: "{% for result in node_hostname.results %}{{ result.stdout }}=https://{{ hostvars[result.item].ansible_host }}:2380{% if not loop.last %},{% endif %}{% endfor %}"
+      when: 
+        - ansible_default_ipv4.address != hostvars[groups['k8s_control_plane'][0]].ansible_host
+        - node_hostname is defined
+
+    - name: Fix etcd manifest IP addresses (kubeadm bug workaround)
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '{{ hostvars[groups["k8s_control_plane"][0]].ansible_host }}'
+        replace: '{{ ansible_default_ipv4.address }}'
+      when: ansible_default_ipv4.address != hostvars[groups['k8s_control_plane'][0]].ansible_host
+      register: etcd_fixed
+
+    - name: Fix etcd initial-cluster parameter (kubeadm bug - missing other members)
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '--initial-cluster={{ ansible_hostname }}=https://{{ ansible_default_ipv4.address }}:2380'
+        replace: '--initial-cluster={{ etcd_initial_cluster }}'
+      when: 
+        - ansible_default_ipv4.address != hostvars[groups['k8s_control_plane'][0]].ansible_host
+        - etcd_initial_cluster is defined
+      register: etcd_cluster_fixed
+
+    - name: Fix kube-apiserver manifest external hostname
+      ansible.builtin.replace:
+        path: /etc/kubernetes/manifests/kube-apiserver.yaml
+        regexp: 'advertise-address={{ hostvars[groups["k8s_control_plane"][0]].ansible_host }}'
+        replace: 'advertise-address={{ ansible_default_ipv4.address }}'
+      when: ansible_default_ipv4.address != hostvars[groups['k8s_control_plane'][0]].ansible_host
+      register: apiserver_fixed
+      failed_when: false
+
+    - name: Display manifest fix status
+      ansible.builtin.debug:
+        msg: 
+          - "✓ etcd manifest on {{ inventory_hostname }}"
+          - "✓ kube-apiserver manifest on {{ inventory_hostname }}"
+      when: etcd_fixed is changed or apiserver_fixed is changed
+
+    - name: Wait for static pods to start
+      ansible.builtin.pause:
+        seconds: 30
+        prompt: "Waiting for kubelet to start static pods on {{ inventory_hostname }}..."
+
+    - name: Display completion message
+      ansible.builtin.debug:
+        msg: "✓ HA components deployed on {{ inventory_hostname }}"
+
+# =============================================================================
+# Phase 8: Join worker nodes
+# =============================================================================
+- name: Phase 8 - Join worker nodes
+  hosts: k8s_workers
+  become: true
+  gather_facts: yes
+  serial: 1
+  tags: ['join-workers']
+  tasks:
+    - name: Check if already joined
+      ansible.builtin.stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_joined
+
+    - name: Fetch join command
+      ansible.builtin.slurp:
+        src: /root/worker-join-command.sh
+      register: worker_join_script
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      when: not worker_joined.stat.exists
+
+    - name: Create join script
+      ansible.builtin.copy:
+        dest: /root/worker-join-command.sh
+        content: "{{ worker_join_script.content | b64decode }}"
+        mode: '0755'
+      when: not worker_joined.stat.exists
+
+    - name: Execute join
+      ansible.builtin.shell: /root/worker-join-command.sh
+      register: worker_join_result
+      when: not worker_joined.stat.exists
+      timeout: 600
+
+# =============================================================================
+# Phase 9: Final Validation
+# =============================================================================
+- name: Phase 9 - Cluster validation
+  hosts: "{{ groups['k8s_control_plane'][0] }}"
+  become: true
+  gather_facts: yes
+  tags: ['validate']
+  tasks:
+    - name: Wait for all nodes Ready
+      ansible.builtin.shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v "Ready" | wc -l
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_not_ready
+      until: nodes_not_ready.stdout | int == 0
+      retries: 5
+      delay: 10
+      changed_when: false
+
+    - name: Get cluster status
+      ansible.builtin.shell: |
+        echo "=== Nodes ==="
+        kubectl get nodes -o wide
+        echo ""
+        echo "=== System Pods ==="
+        kubectl get pods -n kube-system -o wide
+        echo ""
+        echo "=== Static Pods (HA) ==="
+        kubectl get pods -n kube-system | grep -E "haproxy|keepalived"
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: cluster_status
+      changed_when: false
+
+    - name: Display cluster status
+      ansible.builtin.debug:
+        msg: "{{ cluster_status.stdout_lines }}"
+
+    - name: Test VIP connectivity
+      ansible.builtin.uri:
+        url: "https://{{ k8s_vip }}:{{ haproxy_frontend_port }}/healthz"
+        validate_certs: no
+        return_content: yes
+      register: vip_test
+      failed_when: false
+
+    - name: Display success
+      ansible.builtin.debug:
+        msg:
+          - "Kubernetes Stacked HA Cluster Deployed Successfully!"
+          - "VIP: {{ k8s_vip }}:{{ haproxy_frontend_port }}"
+          - "VIP Health: {{ vip_test.content | default('Check manually') }}"

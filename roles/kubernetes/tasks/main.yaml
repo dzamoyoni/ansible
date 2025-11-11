@@ -1,0 +1,198 @@
+---
+# =============================================================================
+# Kubernetes Installation Tasks - FIXED GPG KEY HANDLING
+# File: roles/kubernetes/tasks/main.yml
+# =============================================================================
+
+
+- name: Clear package holds if they exist to allow clean installation
+  ansible.builtin.command: apt-mark unhold kubelet kubeadm kubectl
+  # Use become: yes (inherited from the play)
+  changed_when: false # This task is only cleaning up state, not changing configuration
+  failed_when: false  # Do not fail the playbook if the packages are not marked as held
+  when: ansible_os_family == "Debian"
+
+# 1. CLEANUP - Remove conflicting configurations
+- name: Remove conflicting K8s APT configuration files
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/apt/sources.list.d/kubernetes.list 
+    - /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+    - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - /etc/apt/trusted.gpg.d/kubernetes.gpg
+    - /etc/apt/sources.list.d/kubernetes.repo
+  when: ansible_os_family == "Debian"
+  tags: ['cleanup']
+
+# 2. Update APT cache FIRST (CRITICAL FIX)
+- name: Update APT cache before installing dependencies
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  when: ansible_os_family == "Debian"
+  retries: 3
+  delay: 5
+  register: apt_update
+  until: apt_update is succeeded
+
+# 3. Install base dependencies
+- name: Install dependencies (curl, apt-transport-https, etc.)
+  ansible.builtin.apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - gpg
+      - wget
+    state: present
+    update_cache: no
+  when: ansible_os_family == "Debian"
+  retries: 3
+  delay: 5
+
+# 4. Create keyrings directory
+- name: Create /etc/apt/keyrings directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: '0755'
+  when: ansible_os_family == "Debian"
+
+# 5. Download and properly import Kubernetes GPG key (FIXED METHOD)
+- name: Download Kubernetes GPG key to temporary location
+  ansible.builtin.get_url:
+    url: "https://pkgs.k8s.io/core:/stable:/v{{ (k8s_version | default('1.33.5')).split('.')[0] }}.{{ (k8s_version | default('1.33.5')).split('.')[1] }}/deb/Release.key"
+    dest: /tmp/kubernetes-archive-keyring.asc
+    mode: '0644'
+    force: yes
+    validate_certs: yes
+  when: ansible_os_family == "Debian"
+  retries: 3
+  delay: 5
+  register: gpg_download
+  until: gpg_download is succeeded
+
+# 6. Dearmor the GPG key (convert to binary format)
+- name: Convert GPG key to binary format and save to keyrings
+  ansible.builtin.shell: |
+    cat /tmp/kubernetes-archive-keyring.asc | gpg --dearmor -o /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+  args:
+    creates: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+  when: ansible_os_family == "Debian"
+
+# 7. Set proper permissions on the keyring
+- name: Set permissions on Kubernetes keyring
+  ansible.builtin.file:
+    path: /etc/apt/keyrings/kubernetes-archive-keyring.gpg
+    mode: '0644'
+    owner: root
+    group: root
+  when: ansible_os_family == "Debian"
+
+# 8. Clean up temporary key file
+- name: Remove temporary GPG key file
+  ansible.builtin.file:
+    path: /tmp/kubernetes-archive-keyring.asc
+    state: absent
+  when: ansible_os_family == "Debian"
+
+# 9. Add Kubernetes repository with proper signed-by
+- name: Add Kubernetes apt repository
+  ansible.builtin.copy:
+    dest: /etc/apt/sources.list.d/kubernetes.list
+    content: |
+      deb [signed-by=/etc/apt/keyrings/kubernetes-archive-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ (k8s_version | default('1.33.5')).split('.')[0] }}.{{ (k8s_version | default('1.33.5')).split('.')[1] }}/deb/ /
+    mode: '0644'
+    owner: root
+    group: root
+  when: ansible_os_family == "Debian"
+
+# 10. Update cache after adding repository
+- name: Update APT cache after adding Kubernetes repository
+  ansible.builtin.apt:
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+  retries: 3
+  delay: 5
+  register: apt_update_k8s
+  until: apt_update_k8s is succeeded
+
+# 11. Check available Kubernetes package versions
+- name: Check available Kubernetes package versions
+  ansible.builtin.shell: |
+    apt-cache madison kubeadm | head -5
+  register: available_versions
+  changed_when: false
+  when: ansible_os_family == "Debian"
+  failed_when: false
+
+- name: Display available Kubernetes versions
+  debug:
+    msg: "{{ available_versions.stdout_lines | default(['No versions found - check repository configuration']) }}"
+  when: ansible_os_family == "Debian"
+
+# 12. Install Kubernetes packages
+- name: Install Kubernetes packages (kubelet, kubeadm, kubectl)
+  ansible.builtin.apt:
+    name:
+      - "kubelet={{ k8s_version | default('1.33.5') }}-1.1"
+      - "kubeadm={{ k8s_version | default('1.33.5') }}-1.1"
+      - "kubectl={{ k8s_version | default('1.33.5') }}-1.1"
+    state: present
+    update_cache: no
+    allow_downgrade: yes
+  when: ansible_os_family == "Debian"
+  retries: 3
+  delay: 5
+  register: k8s_install
+  until: k8s_install is succeeded
+
+# 13. Hold packages from updates
+- name: Hold Kubernetes packages from automatic updates
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop:
+    - kubelet
+    - kubeadm
+    - kubectl
+  when: ansible_os_family == "Debian"
+
+# 14. Enable and start kubelet
+- name: Enable and start kubelet service
+  ansible.builtin.systemd:
+    name: kubelet
+    enabled: yes
+    state: started
+    daemon_reload: yes
+
+# 15. Verify installation
+# ... (Tasks 1 to 14 remain unchanged)
+
+# 15. Verify installation (Clean, separated checks)
+
+- name: Verify Kubelet binary version
+  ansible.builtin.command: kubelet --version
+  register: kubelet_ver_check 
+  changed_when: false
+  failed_when: kubelet_ver_check.rc != 0 
+
+- name: Verify Kubeadm binary version
+  ansible.builtin.command: kubeadm version -o short
+  register: kubeadm_ver_check 
+  changed_when: false
+  failed_when: kubeadm_ver_check.rc != 0 
+
+- name: Display installation verification (Kubelet and Kubeadm)
+  ansible.builtin.debug:
+    # This task uses the newly defined variables: kubelet_ver_check and kubeadm_ver_check
+    msg: 
+      - "✓ Kubelet installed: {{ kubelet_ver_check.stdout }}"
+      - "✓ Kubeadm installed: {{ kubeadm_ver_check.stdout }}"
+  when: kubelet_ver_check is succeeded and kubeadm_ver_check is succeeded
+
+# --- END OF ROLE TASKS ---
+# The old, failing debug block that referenced 'k8s_verify.results' is completely removed.

@@ -1,0 +1,39 @@
+---
+- name: Reset Kubernetes Cluster
+  hosts: k8s_cluster
+  become: true
+  gather_facts: no
+  tasks:
+    - name: Reset kubeadm
+      ansible.builtin.shell: kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
+      register: reset_result
+      failed_when: false
+
+    - name: Remove Kubernetes directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /var/lib/haproxy
+        - /root/.kube
+
+    - name: Restart cri-docker
+      ansible.builtin.systemd:
+        name: cri-docker
+        state: restarted
+        daemon_reload: yes
+      failed_when: false
+
+    - name: Restart kubelet
+      ansible.builtin.systemd:
+        name: kubelet
+        state: restarted
+        daemon_reload: yes
+      failed_when: false
+
+    - name: Display reset status
+      ansible.builtin.debug:
+        msg: "✓ {{ inventory_hostname }} reset complete"

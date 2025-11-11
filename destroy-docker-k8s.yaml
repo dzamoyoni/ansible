@@ -1,0 +1,687 @@
+---
+# =============================================================================
+# Kubernetes HA Cluster and Docker Destruction Playbook
+# WARNING: This will completely remove Kubernetes and Docker from all nodes
+# =============================================================================
+
+- name: Record start time
+  hosts: localhost
+  gather_facts: yes
+  tasks:
+    - name: Record playbook start time
+      set_fact:
+        playbook_start_time: "{{ ansible_date_time.epoch }}"
+        playbook_start_iso: "{{ ansible_date_time.iso8601 }}"
+
+- name: WARNING - Confirm Cluster Destruction
+  hosts: localhost
+  gather_facts: no
+  
+  tasks:
+    - name: Display destruction warning
+      debug:
+        msg:
+          - "⚠️  WARNING: DESTRUCTIVE OPERATION ⚠️"
+          - ""
+          - "This playbook will completely destroy:"
+          - "  - Kubernetes cluster (all control plane and worker nodes)"
+          - "  - All pods, services, and workloads"
+          - "  - Docker and containerd"
+          - "  - All container images and volumes"
+          - "  - All configuration files"
+          - ""
+          - "Target nodes: {{ groups.get('k8s_cluster', groups.get('k8s_nodes', [])) | join(', ') }}"
+          - ""
+          - "Press Ctrl+C and then 'A' to abort"
+          
+    - name: Pause for confirmation
+      pause:
+        prompt: "Type 'destroy' to continue"
+      register: confirmation
+      
+    - name: Validate confirmation
+      assert:
+        that:
+          - confirmation.user_input == "destroy"
+        fail_msg: "Destruction aborted - confirmation not provided"
+
+# =============================================================================
+# Phase 1: Reset Kubernetes Cluster (All Nodes)
+# =============================================================================
+- name: Phase 1 - Reset Kubernetes cluster with kubeadm
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if Kubernetes is installed
+      stat:
+        path: /etc/kubernetes
+      register: k8s_exists
+      
+    - name: Check if kubeadm exists
+      command: which kubeadm
+      register: kubeadm_exists
+      failed_when: false
+      changed_when: false
+      
+    - name: Check if kubelet service exists
+      systemd:
+        name: kubelet
+      register: kubelet_service
+      failed_when: false
+      changed_when: false
+      
+    - name: Display Kubernetes status
+      debug:
+        msg:
+          - "Kubernetes installed: {{ 'Yes' if k8s_exists.stat.exists else 'No - Skipping' }}"
+          - "kubeadm available: {{ 'Yes' if kubeadm_exists.rc == 0 else 'No' }}"
+          - "kubelet service: {{ 'Found' if kubelet_service.status is defined else 'Not found' }}"
+      
+    - name: Stop kubelet service
+      systemd:
+        name: kubelet
+        state: stopped
+      when: 
+        - kubelet_service.status is defined
+        - k8s_exists.stat.exists
+      ignore_errors: yes
+      
+    - name: Reset kubeadm (with cri-dockerd)
+      command: kubeadm reset --force --cri-socket=unix:///var/run/cri-dockerd.sock
+      when: 
+        - k8s_exists.stat.exists
+        - kubeadm_exists.rc == 0
+      register: kubeadm_reset_result
+      failed_when: false
+      
+    - name: Display kubeadm reset result
+      debug:
+        msg: "kubeadm reset: {{ 'Success' if kubeadm_reset_result.rc | default(1) == 0 else 'Failed or skipped' }}"
+      when: kubeadm_reset_result is defined and kubeadm_reset_result.rc is defined
+
+# =============================================================================
+# Phase 2: Remove Kubernetes Packages and Configuration
+# =============================================================================
+- name: Phase 2 - Remove Kubernetes packages and configuration
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check which Kubernetes packages are installed (Debian/Ubuntu)
+      shell: dpkg -l | grep -E '^ii\s+(kubelet|kubeadm|kubectl)' | awk '{print $2}'
+      register: k8s_packages_installed
+      when: ansible_os_family == "Debian"
+      failed_when: false
+      changed_when: false
+      
+    - name: Display installed Kubernetes packages
+      debug:
+        msg: "Installed packages: {{ k8s_packages_installed.stdout_lines | default(['None']) }}"
+      when: ansible_os_family == "Debian"
+      
+    - name: Unhold Kubernetes packages first (Debian/Ubuntu)
+      command: apt-mark unhold {{ item }}
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+      when: 
+        - ansible_os_family == "Debian"
+        - k8s_packages_installed.stdout_lines | default([]) | length > 0
+      ignore_errors: yes
+      
+    - name: Remove Kubernetes packages (Debian/Ubuntu)
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+        purge: yes
+        autoremove: yes
+      when: 
+        - ansible_os_family == "Debian"
+        - k8s_packages_installed.stdout_lines | default([]) | length > 0
+      register: k8s_remove_result
+      
+    - name: Remove Kubernetes packages (RHEL/CentOS/Rocky)
+      yum:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: absent
+      when: ansible_os_family == "RedHat"
+      register: k8s_remove_result_rhel
+      ignore_errors: yes
+      
+    - name: Remove Kubernetes directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/kubelet
+        - /var/lib/etcd
+        - /etc/cni
+        - /opt/cni
+        - /var/lib/cni
+        - /run/flannel
+        - /etc/systemd/system/kubelet.service.d
+        - /etc/systemd/system/kubelet.service
+        
+    - name: Remove Kubernetes configuration files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/kubernetes.list
+        - /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        - /etc/yum.repos.d/kubernetes.repo
+        - /home/{{ ansible_user }}/.kube
+        - /root/.kube
+        
+    - name: Remove kubectl bash completion
+      file:
+        path: /etc/bash_completion.d/kubectl
+        state: absent
+
+# =============================================================================
+# Phase 3: Remove HAProxy and Keepalived (Load Balancers)
+# =============================================================================
+- name: Phase 3 - Remove HAProxy and Keepalived
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if this node is a load balancer
+      set_fact:
+        is_load_balancer: "{{ inventory_hostname in groups.get('k8s_load_balancers', []) }}"
+        
+    - name: Remove static pod manifests
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes/manifests/haproxy.yaml
+        - /etc/kubernetes/manifests/keepalived.yaml
+      when: is_load_balancer | default(false)
+        
+    - name: Stop HAProxy service
+      systemd:
+        name: haproxy
+        state: stopped
+      when: is_load_balancer | default(false)
+      ignore_errors: yes
+      
+    - name: Stop Keepalived service
+      systemd:
+        name: keepalived
+        state: stopped
+      when: is_load_balancer | default(false)
+      ignore_errors: yes
+      
+    - name: Remove HAProxy and Keepalived packages (Debian/Ubuntu)
+      apt:
+        name:
+          - haproxy
+          - keepalived
+        state: absent
+        purge: yes
+        autoremove: yes
+      when: 
+        - is_load_balancer | default(false)
+        - ansible_os_family == "Debian"
+      
+    - name: Remove HAProxy and Keepalived packages (RHEL/CentOS/Rocky)
+      yum:
+        name:
+          - haproxy
+          - keepalived
+        state: absent
+      when: 
+        - is_load_balancer | default(false)
+        - ansible_os_family == "RedHat"
+      
+    - name: Remove HAProxy and Keepalived configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/haproxy
+        - /etc/haproxy-k8s
+        - /etc/keepalived
+        - /etc/keepalived-k8s
+        - /var/lib/haproxy
+        - /usr/local/bin/ha-lb-check.sh
+        - /usr/local/bin/keepalived-notify.sh
+      when: is_load_balancer | default(false)
+        
+    - name: Remove Virtual IP (if assigned)
+      command: ip addr del {{ k8s_vip }}/32 dev {{ k8s_vip_interface }}
+      when: 
+        - is_load_balancer | default(false)
+        - k8s_vip is defined
+      ignore_errors: yes
+
+# =============================================================================
+# Phase 4: Remove Docker and Container Runtime
+# =============================================================================
+- name: Phase 4 - Remove Docker and container runtime
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if Docker is installed
+      command: which docker
+      register: docker_exists
+      failed_when: false
+      changed_when: false
+      
+    - name: Check if containerd is installed
+      command: which containerd
+      register: containerd_exists
+      failed_when: false
+      changed_when: false
+      
+    - name: Check if cri-dockerd is installed
+      command: which cri-dockerd
+      register: cri_dockerd_exists
+      failed_when: false
+      changed_when: false
+      
+    - name: Display Docker component status
+      debug:
+        msg:
+          - "Docker: {{ 'Installed' if docker_exists.rc == 0 else 'Not found - Skipping' }}"
+          - "containerd: {{ 'Installed' if containerd_exists.rc == 0 else 'Not found - Skipping' }}"
+          - "cri-dockerd: {{ 'Installed' if cri_dockerd_exists.rc == 0 else 'Not found - Skipping' }}"
+      
+    - name: Get list of running containers
+      shell: docker ps -aq
+      register: docker_containers
+      when: docker_exists.rc == 0
+      failed_when: false
+      changed_when: false
+      
+    - name: Stop all running containers
+      shell: docker stop $(docker ps -aq)
+      when: 
+        - docker_exists.rc == 0
+        - docker_containers.stdout != ""
+      ignore_errors: yes
+      
+    - name: Remove all containers
+      shell: docker rm -f $(docker ps -aq)
+      when: 
+        - docker_exists.rc == 0
+        - docker_containers.stdout != ""
+      ignore_errors: yes
+      
+    - name: Get list of Docker images
+      shell: docker images -aq
+      register: docker_images
+      when: docker_exists.rc == 0
+      failed_when: false
+      changed_when: false
+      
+    - name: Remove all Docker images
+      shell: docker rmi -f $(docker images -aq)
+      when: 
+        - docker_exists.rc == 0
+        - docker_images.stdout != ""
+      ignore_errors: yes
+      
+    - name: Get list of Docker volumes
+      shell: docker volume ls -q
+      register: docker_volumes
+      when: docker_exists.rc == 0
+      failed_when: false
+      changed_when: false
+      
+    - name: Remove all Docker volumes
+      shell: docker volume rm $(docker volume ls -q)
+      when: 
+        - docker_exists.rc == 0
+        - docker_volumes.stdout != ""
+      ignore_errors: yes
+      
+    - name: Get list of Docker networks
+      shell: docker network ls --filter type=custom -q
+      register: docker_networks
+      when: docker_exists.rc == 0
+      failed_when: false
+      changed_when: false
+      
+    - name: Remove custom Docker networks
+      shell: docker network rm $(docker network ls --filter type=custom -q)
+      when: 
+        - docker_exists.rc == 0
+        - docker_networks.stdout != ""
+      ignore_errors: yes
+      
+    - name: Check which Docker services exist
+      systemd:
+        name: "{{ item }}"
+      loop:
+        - docker
+        - docker.socket
+        - containerd
+        - cri-docker
+        - cri-docker.socket
+      register: docker_services_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Stop Docker services that exist
+      systemd:
+        name: "{{ item.item }}"
+        state: stopped
+      loop: "{{ docker_services_check.results }}"
+      when: 
+        - item.status is defined
+        - item.status.LoadState == "loaded"
+      ignore_errors: yes
+      
+    - name: Remove cri-dockerd package (Debian/Ubuntu)
+      apt:
+        name: cri-dockerd
+        state: absent
+        purge: yes
+      when: 
+        - ansible_os_family == "Debian"
+        - cri_dockerd_exists.rc == 0
+      ignore_errors: yes
+      
+    - name: Remove cri-dockerd package (RHEL/CentOS/Rocky)
+      yum:
+        name: cri-dockerd
+        state: absent
+      when: 
+        - ansible_os_family == "RedHat"
+        - cri_dockerd_exists.rc == 0
+      ignore_errors: yes
+      
+    - name: Remove Docker packages (Debian/Ubuntu)
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+          - docker-ce-rootless-extras
+        state: absent
+        purge: yes
+        autoremove: yes
+      when: 
+        - ansible_os_family == "Debian"
+        - docker_exists.rc == 0 or containerd_exists.rc == 0
+      register: docker_removal_result
+      
+    - name: Remove Docker packages (RHEL/CentOS/Rocky)
+      yum:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: absent
+      when: 
+        - ansible_os_family == "RedHat"
+        - docker_exists.rc == 0 or containerd_exists.rc == 0
+      register: docker_removal_result_rhel
+      
+    - name: Remove Docker and containerd directories
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /var/lib/docker
+        - /var/lib/dockershim
+        - /var/lib/containerd
+        - /etc/docker
+        - /etc/containerd
+        - /var/run/docker.sock
+        - /var/run/containerd
+        - /var/run/cri-dockerd.sock
+        - /run/containerd
+      ignore_errors: yes
+      
+    - name: Force unmount and remove busy Docker directories
+      shell: |
+        if mountpoint -q {{ item }}; then
+          umount -f {{ item }} 2>/dev/null || true
+        fi
+        rm -rf {{ item }} 2>/dev/null || true
+      loop:
+        - /var/run/docker
+        - /run/docker
+      ignore_errors: yes
+        
+    - name: Remove Docker repository files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list
+        - /etc/apt/keyrings/docker.asc
+        - /etc/yum.repos.d/docker-ce.repo
+        - /etc/yum.repos.d/docker-ce-stable.repo
+        
+    - name: Remove Docker group
+      group:
+        name: docker
+        state: absent
+
+# =============================================================================
+# Phase 5: Clean System Configuration
+# =============================================================================
+- name: Phase 5 - Clean system configuration
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Remove Kubernetes kernel modules configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/modules-load.d/k8s.conf
+        - /etc/modules-load.d/containerd.conf
+        
+    - name: Remove Kubernetes sysctl configuration
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/sysctl.d/k8s.conf
+        - /etc/sysctl.d/99-kubernetes-cri.conf
+        
+    - name: Unload kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: absent
+      loop:
+        - br_netfilter
+        - overlay
+        - ip_vs
+        - ip_vs_rr
+        - ip_vs_wrr
+        - ip_vs_sh
+      ignore_errors: yes
+      
+    - name: Re-enable swap
+      command: swapon -a
+      ignore_errors: yes
+      
+    - name: Restore swap entries in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^#\s*(.+\s+swap\s+.*)$'
+        replace: '\1'
+      ignore_errors: yes
+      
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+        
+    - name: Remove systemd service files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/docker.service
+        - /etc/systemd/system/docker.socket
+        - /etc/systemd/system/containerd.service
+        - /etc/systemd/system/cri-docker.service
+        - /etc/systemd/system/cri-docker.socket
+        - /lib/systemd/system/docker.service
+        - /lib/systemd/system/docker.socket
+        - /lib/systemd/system/containerd.service
+        
+    - name: Reload systemd after cleanup
+      systemd:
+        daemon_reload: yes
+        
+    - name: Clean iptables rules (Kubernetes)
+      shell: |
+        iptables -F
+        iptables -X
+        iptables -t nat -F
+        iptables -t nat -X
+        iptables -t mangle -F
+        iptables -t mangle -X
+        iptables -P INPUT ACCEPT
+        iptables -P FORWARD ACCEPT
+        iptables -P OUTPUT ACCEPT
+      ignore_errors: yes
+      
+    - name: Clean ip6tables rules
+      shell: |
+        ip6tables -F
+        ip6tables -X
+        ip6tables -t nat -F
+        ip6tables -t nat -X
+        ip6tables -t mangle -F
+        ip6tables -t mangle -X
+      ignore_errors: yes
+      
+    - name: Remove network interfaces created by Kubernetes
+      shell: |
+        ip link delete cni0 2>/dev/null || true
+        ip link delete flannel.1 2>/dev/null || true
+        ip link delete docker0 2>/dev/null || true
+      ignore_errors: yes
+      
+    - name: Clean up temp files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /tmp/kubeadm-config.yaml
+        - /tmp/kubeadm-init-output.txt
+        - /tmp/control-plane-join.txt
+        - /tmp/worker-join.txt
+        - /tmp/k8s-cluster-summary.md
+        - /tmp/cri-dockerd.deb
+        - /tmp/cri-dockerd.rpm
+
+# =============================================================================
+# Phase 6: Final Cleanup and Verification
+# =============================================================================
+- name: Phase 6 - Final cleanup and verification
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Update package cache (Debian/Ubuntu)
+      apt:
+        update_cache: yes
+      when: ansible_os_family == "Debian"
+      
+    - name: Update package cache (RHEL/CentOS/Rocky)
+      yum:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+      
+    - name: Check for remaining Kubernetes processes
+      shell: ps aux | grep -E 'kube|etcd|docker|containerd' | grep -v grep
+      register: remaining_processes
+      failed_when: false
+      changed_when: false
+      
+    - name: Display remaining processes (if any)
+      debug:
+        msg: "{{ remaining_processes.stdout_lines }}"
+      when: remaining_processes.stdout != ""
+      
+    - name: Verify Docker is removed
+      command: docker --version
+      register: docker_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Verify Kubernetes is removed
+      command: kubectl version --client
+      register: kubectl_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Display cleanup status
+      debug:
+        msg:
+          - "Node: {{ inventory_hostname }}"
+          - "Docker removed: {{ 'Yes' if docker_check.rc != 0 else 'No - Still installed' }}"
+          - "Kubernetes removed: {{ 'Yes' if kubectl_check.rc != 0 else 'No - Still installed' }}"
+
+# =============================================================================
+# Phase 7: Summary
+# =============================================================================
+- name: Phase 7 - Display destruction summary
+  hosts: localhost
+  gather_facts: yes
+  
+  tasks:
+    - name: Calculate execution time
+      set_fact:
+        playbook_end_time: "{{ ansible_date_time.epoch }}"
+        execution_seconds: "{{ ansible_date_time.epoch | int - hostvars['localhost']['playbook_start_time'] | int }}"
+        
+    - name: Format execution time
+      set_fact:
+        execution_minutes: "{{ (execution_seconds | int / 60) | int }}"
+        execution_remaining_seconds: "{{ execution_seconds | int % 60 }}"
+        
+    - name: Display completion message
+      debug:
+        msg:
+          - " Kubernetes HA Cluster Destruction COMPLETED"
+          - ""
+          - "  Execution Time: {{ execution_minutes }}m {{ execution_remaining_seconds }}s"
+          - " Started:  {{ hostvars['localhost']['playbook_start_iso'] }}"
+          - " Finished: {{ ansible_date_time.iso8601 }}"
+          - ""
+          - "The following has been removed from all nodes:"
+          - "  ✓ Kubernetes cluster (control plane and workers)"
+          - "  ✓ Docker and containerd"
+          - "  ✓ HAProxy and Keepalived"
+          - "  ✓ All container images and volumes"
+          - "  ✓ All configuration files"
+          - "  ✓ Network interfaces and iptables rules"
+          - ""
+          - "Nodes affected: {{ (groups.get('k8s_control_plane', []) + groups.get('k8s_workers', [])) | join(', ') }}"
+          - ""
+          - " Next steps:"
+          - "  1. Reboot nodes if needed"
+          - "  2. Verify all processes are stopped"
+          - "  3. Check disk space has been reclaimed"
+          - "  4. Nodes are now clean and ready for redeployment"

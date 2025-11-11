@@ -1,0 +1,83 @@
+# ==============================================
+# Global Variables for HA Kubernetes Cluster
+# ==============================================
+
+# Kubernetes Configuration
+kubernetes:
+  version: "1.33.0"
+  repo_version: "v1.33"
+  cni_plugin: "calico"
+  pod_network_cidr: "10.244.0.0/16"  # Must match inventory
+  service_subnet: "10.96.0.0/12"     # Must match inventory
+  cluster_dns: "10.96.0.10"
+  
+# Docker/Container Runtime Configuration  
+docker:
+  version: "24.0.7"  
+  repo_arch: "amd64"
+  storage_driver: "overlay2"
+  log_driver: "json-file"
+  log_max_size: "100m"
+  log_max_file: "3"
+  pin_versions: true
+  use_version_ranges: false
+
+# CRI-dockerd Configuration
+cri_dockerd:
+  version: "0.3.17"
+  debian_package: "cri-dockerd_0.3.17.3-0.debian-bookworm_amd64.deb"
+  rhel_package: "cri-dockerd-0.3.17-3.el8.x86_64.rpm"
+
+# HA Load Balancer Configuration
+haproxy:
+  version: "2.8"
+  # Both frontend and backend use 6443 (standard k8s API port)
+  api_server_port: 6443
+  bind_port: 6443
+  check_interval: "3s"
+  rise_count: 2
+  fall_count: 3
+  stats_port: 8404
+  stats_uri: "/stats"
+  stats_user: "admin"
+  stats_pass: "admin123"
+
+keepalived:
+  version: "2.2.4"
+  auth_pass: "k8s_ha_auth_2024"
+  check_interval: 2
+  vrrp_instance_name: "VI_1"
+
+# OS-specific package managers
+package_managers:
+  debian:
+    update_cache: "apt update"
+    install: "apt install -y"
+    repository_key_path: "/etc/apt/keyrings"
+    repository_list_path: "/etc/apt/sources.list.d"
+  rhel:
+    update_cache: "yum makecache"
+    install: "yum install -y" 
+    repository_path: "/etc/yum.repos.d"
+
+# System Configuration
+system:
+  disable_swap: true
+  enable_kernel_modules:
+    - br_netfilter
+    - overlay
+    - ip_vs
+    - ip_vs_rr
+    - ip_vs_wrr
+    - ip_vs_sh
+  sysctl_settings:
+    net.bridge.bridge-nf-call-iptables: 1
+    net.bridge.bridge-nf-call-ip6tables: 1
+    net.ipv4.ip_forward: 1
+    net.ipv4.ip_nonlocal_bind: 1  # Required for VIP binding
+
+# Service Configuration
+systemd_services:
+  - docker
+  - cri-docker
+  - kubelet

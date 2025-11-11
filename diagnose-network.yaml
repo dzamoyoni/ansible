@@ -1,0 +1,142 @@
+---
+- name: Network Diagnostics for Kubernetes HA Cluster
+  hosts: k8s_cluster
+  become: true
+  gather_facts: yes
+  tasks:
+    - name: Display node information
+      ansible.builtin.debug:
+        msg:
+          - "Hostname: {{ ansible_hostname }}"
+          - "IP Address: {{ ansible_default_ipv4.address }}"
+          - "Interface: {{ ansible_default_ipv4.interface }}"
+
+    - name: Check if required ports are listening locally
+      ansible.builtin.shell: |
+        echo "=== Listening Ports ==="
+        ss -tlnp | grep -E ':(10250|6443|6444|2379|2380)' || echo "No Kubernetes ports listening"
+      register: listening_ports
+      changed_when: false
+
+    - name: Display listening ports
+      ansible.builtin.debug:
+        msg: "{{ listening_ports.stdout_lines }}"
+
+    - name: Check local iptables rules
+      ansible.builtin.shell: |
+        echo "=== INPUT Chain ==="
+        iptables -L INPUT -n -v --line-numbers | head -20
+        echo ""
+        echo "=== FORWARD Chain ==="
+        iptables -L FORWARD -n -v --line-numbers | head -10
+      register: iptables_rules
+      changed_when: false
+
+    - name: Display iptables rules
+      ansible.builtin.debug:
+        msg: "{{ iptables_rules.stdout_lines }}"
+
+- name: Test Inter-Node Connectivity
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  tasks:
+    - name: Build list of other control plane nodes
+      ansible.builtin.set_fact:
+        other_nodes: "{{ groups['k8s_control_plane'] | difference([inventory_hostname]) }}"
+
+    - name: Test ping to other nodes
+      ansible.builtin.shell: |
+        ping -c 2 {{ hostvars[item].ansible_host }} && echo "PING_OK" || echo "PING_FAILED"
+      loop: "{{ other_nodes }}"
+      register: ping_results
+      changed_when: false
+      failed_when: false
+
+    - name: Test TCP connectivity on port 22 (SSH - should work)
+      ansible.builtin.shell: |
+        timeout 2 bash -c "</dev/tcp/{{ hostvars[item].ansible_host }}/22" && echo "SSH_OK" || echo "SSH_BLOCKED"
+      loop: "{{ other_nodes }}"
+      register: ssh_test
+      changed_when: false
+      failed_when: false
+
+    - name: Test TCP connectivity on port 10250 (kubelet)
+      ansible.builtin.shell: |
+        timeout 2 bash -c "</dev/tcp/{{ hostvars[item].ansible_host }}/10250" && echo "KUBELET_OK" || echo "KUBELET_BLOCKED"
+      loop: "{{ other_nodes }}"
+      register: kubelet_test
+      changed_when: false
+      failed_when: false
+
+    - name: Test TCP connectivity on port 2379 (etcd client)
+      ansible.builtin.shell: |
+        timeout 2 bash -c "</dev/tcp/{{ hostvars[item].ansible_host }}/2379" && echo "ETCD_CLIENT_OK" || echo "ETCD_CLIENT_BLOCKED"
+      loop: "{{ other_nodes }}"
+      register: etcd_client_test
+      changed_when: false
+      failed_when: false
+
+    - name: Test TCP connectivity on port 2380 (etcd peer)
+      ansible.builtin.shell: |
+        timeout 2 bash -c "</dev/tcp/{{ hostvars[item].ansible_host }}/2380" && echo "ETCD_PEER_OK" || echo "ETCD_PEER_BLOCKED"
+      loop: "{{ other_nodes }}"
+      register: etcd_peer_test
+      changed_when: false
+      failed_when: false
+
+    - name: Display connectivity test results
+      ansible.builtin.debug:
+        msg:
+          - "=== Connectivity from {{ inventory_hostname }} ==="
+          - "Ping: {{ ping_results.results | map(attribute='stdout_lines') | list }}"
+          - "SSH (22): {{ ssh_test.results | map(attribute='stdout_lines') | list }}"
+          - "Kubelet (10250): {{ kubelet_test.results | map(attribute='stdout_lines') | list }}"
+          - "etcd client (2379): {{ etcd_client_test.results | map(attribute='stdout_lines') | list }}"
+          - "etcd peer (2380): {{ etcd_peer_test.results | map(attribute='stdout_lines') | list }}"
+
+- name: Check for External Firewalls/Security Groups
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: no
+  tasks:
+    - name: Check for firewalld
+      ansible.builtin.shell: |
+        systemctl is-active firewalld 2>/dev/null || echo "not-running"
+      register: firewalld_status
+      changed_when: false
+
+    - name: Check for ufw
+      ansible.builtin.shell: |
+        ufw status 2>/dev/null || echo "not-installed"
+      register: ufw_status
+      changed_when: false
+
+    - name: Display firewall status
+      ansible.builtin.debug:
+        msg:
+          - "Firewalld: {{ firewalld_status.stdout }}"
+          - "UFW: {{ ufw_status.stdout }}"
+
+    - name: Check routing table
+      ansible.builtin.shell: ip route show
+      register: routes
+      changed_when: false
+
+    - name: Display routes
+      ansible.builtin.debug:
+        msg: "{{ routes.stdout_lines }}"
+
+    - name: Check for iptables Calico rules that might block
+      ansible.builtin.shell: |
+        echo "=== Calico cali-INPUT chain ==="
+        iptables -L cali-INPUT -n -v 2>/dev/null | head -15 || echo "No Calico chain"
+        echo ""
+        echo "=== Calico cali-FORWARD chain ==="
+        iptables -L cali-FORWARD -n -v 2>/dev/null | head -15 || echo "No Calico chain"
+      register: calico_rules
+      changed_when: false
+
+    - name: Display Calico rules
+      ansible.builtin.debug:
+        msg: "{{ calico_rules.stdout_lines }}"

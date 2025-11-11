@@ -1,0 +1,99 @@
+---
+- name: Debug kubelet configuration
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if kubelet config file exists
+      stat:
+        path: /etc/default/kubelet
+      register: kubelet_config_file
+      
+    - name: Display kubelet config file status
+      debug:
+        msg: "Kubelet config exists: {{ kubelet_config_file.stat.exists }}"
+        
+    - name: Read kubelet config if exists
+      slurp:
+        path: /etc/default/kubelet
+      register: kubelet_config_content
+      when: kubelet_config_file.stat.exists
+      
+    - name: Display kubelet config content
+      debug:
+        msg: "{{ kubelet_config_content.content | b64decode }}"
+      when: kubelet_config_file.stat.exists
+      
+    - name: Check kubelet service status
+      command: systemctl status kubelet
+      register: kubelet_status
+      failed_when: false
+      
+    - name: Display kubelet service status
+      debug:
+        msg: "{{ kubelet_status.stdout_lines }}"
+        
+    - name: Check kubelet logs (last 50 lines)
+      command: journalctl -xeu kubelet -n 50 --no-pager
+      register: kubelet_logs
+      failed_when: false
+      
+    - name: Display kubelet logs
+      debug:
+        msg: "{{ kubelet_logs.stdout_lines }}"
+        
+    - name: Check if cri-dockerd is running
+      command: systemctl status cri-docker
+      register: cri_docker_status
+      failed_when: false
+      
+    - name: Display cri-dockerd status
+      debug:
+        msg: "{{ cri_docker_status.stdout_lines }}"
+        
+    - name: Check if cri-dockerd socket exists
+      stat:
+        path: /var/run/cri-dockerd.sock
+      register: cri_socket
+      
+    - name: Display cri-dockerd socket status
+      debug:
+        msg: "CRI socket exists: {{ cri_socket.stat.exists }}"
+        
+    - name: Check Docker status
+      command: systemctl status docker
+      register: docker_status
+      failed_when: false
+      
+    - name: Display Docker status
+      debug:
+        msg: "{{ docker_status.stdout_lines }}"
+        
+    - name: Check containerd status
+      command: systemctl status containerd
+      register: containerd_status
+      failed_when: false
+      
+    - name: Display containerd status
+      debug:
+        msg: "{{ containerd_status.stdout_lines }}"
+        
+    - name: Check if swap is disabled
+      command: swapon --show
+      register: swap_status
+      failed_when: false
+      changed_when: false
+      
+    - name: Display swap status
+      debug:
+        msg: "Swap: {{ 'ENABLED - THIS IS A PROBLEM!' if swap_status.stdout != '' else 'Disabled - OK' }}"
+        
+    - name: Check loaded kernel modules
+      shell: lsmod | grep -E 'br_netfilter|overlay'
+      register: kernel_modules
+      failed_when: false
+      
+    - name: Display kernel modules
+      debug:
+        msg: "{{ kernel_modules.stdout_lines }}"

@@ -1,0 +1,277 @@
+---
+# =======================================================
+# Common setup tasks for all Kubernetes nodes
+# =======================================================
+
+- name: Set OS-specific variables
+  include_vars: "{{ ansible_os_family | lower }}.yaml"
+  
+- name: Display target OS information
+  debug:
+    msg: 
+      - "Target OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+      - "OS Family: {{ ansible_os_family }}"
+      - "Architecture: {{ ansible_architecture }}"
+
+# =======================================================
+# Configure /etc/hosts for inter-node DNS resolution
+# =======================================================
+- name: Add control plane nodes to /etc/hosts
+  lineinfile:
+    path: /etc/hosts
+    line: "{{ hostvars[item]['ansible_host'] }} {{ hostvars[item]['ansible_hostname'] }}"
+    regexp: "^{{ hostvars[item]['ansible_host'] }}\\s+{{ hostvars[item]['ansible_hostname'] }}"
+    state: present
+  loop: "{{ groups['k8s_control_plane'] }}"
+  when: groups['k8s_control_plane'] is defined
+
+# =======================================================
+# System Prerequisites
+# =======================================================
+- name: Check if swap is already disabled
+  command: swapon --show
+  register: swap_status
+  failed_when: false
+  changed_when: false
+
+- name: Disable swap permanently
+  block:
+    - name: Turn off swap immediately
+      command: swapoff -a
+      when: swap_status.stdout != ""
+      
+    - name: Remove swap entries from /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+.*)$'
+        replace: '# \1'
+        backup: yes
+  when: system.disable_swap and swap_status.stdout != ""
+
+- name: Load required kernel modules
+  modprobe:
+    name: "{{ item }}"
+    state: present
+  loop: "{{ system.enable_kernel_modules }}"
+  register: kernel_modules_loaded
+
+- name: Make kernel modules persistent
+  copy:
+    content: |
+      # Kubernetes required modules
+      {% for module in system.enable_kernel_modules %}
+      {{ module }}
+      {% endfor %}
+    dest: /etc/modules-load.d/k8s.conf
+    mode: '0644'
+  when: kernel_modules_loaded.changed
+
+- name: Check current sysctl settings
+  command: sysctl {{ item.key }}
+  register: current_sysctl
+  loop: "{{ system.sysctl_settings | dict2items }}"
+  changed_when: false
+  failed_when: false
+
+- name: Apply sysctl settings for Kubernetes
+  sysctl:
+    name: "{{ item.key }}"
+    value: "{{ item.value }}"
+    state: present
+    sysctl_file: /etc/sysctl.d/k8s.conf
+    reload: yes
+  loop: "{{ system.sysctl_settings | dict2items }}"
+  when: >
+    current_sysctl.results | 
+    selectattr('item.key', 'equalto', item.key) | 
+    map(attribute='stdout') | 
+    first | 
+    regex_replace('.*= ', '') != (item.value | string)
+
+# =======================================================
+# Package Installation (OS-specific)
+# =======================================================
+- name: Install common packages (Debian/Ubuntu)
+  apt:
+    name:
+      - curl
+      - wget
+      - apt-transport-https
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - software-properties-common
+      - net-tools
+      - htop
+      - vim
+    state: present
+    update_cache: false 
+  when: ansible_os_family == "Debian"
+
+- name: Install common packages (RHEL/CentOS/Rocky)
+  yum:
+    name:
+      - curl
+      - wget
+      - ca-certificates
+      - gnupg2
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+      - net-tools
+      - htop
+      - vim
+      - firewalld
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "RedHat"
+
+# =======================================================
+# Firewall Configuration
+# =======================================================
+- name: Configure iptables firewall (Ubuntu/Debian)
+  block:
+    - name: Install iptables-persistent
+      apt:
+        name: iptables-persistent
+        state: present
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    # Fix Calico iptables-nft conflict
+    - name: Switch to iptables-legacy mode (Calico compatibility)
+      ansible.builtin.alternatives:
+        name: "{{ item }}"
+        path: "/usr/sbin/{{ item }}-legacy"
+      loop:
+        - iptables
+        - ip6tables
+      
+    - name: Flush nftables rules to prevent conflicts
+      ansible.builtin.shell: |
+        nft flush ruleset || true
+      changed_when: false
+      failed_when: false
+      
+    - name: Allow SSH
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: '22'
+        jump: ACCEPT
+        comment: Allow SSH
+        
+    - name: Allow Kubernetes ports
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "{{ item }}"
+        jump: ACCEPT
+        comment: "Allow Kubernetes {{ item }}"
+      loop:
+        - '6443'      # API server (VIP)
+        - '6444'      # API server (stacked HA backend)
+        - '10250'     # kubelet
+        - '10259'     # scheduler
+        - '10257'     # controller-manager
+        - '2379'      # etcd
+        - '2380'      # etcd
+        - '179'       # BGP (Calico)
+        
+    - name: Allow NodePort range
+      iptables:
+        chain: INPUT
+        protocol: tcp
+        destination_port: "30000:32767"
+        jump: ACCEPT
+        comment: Allow NodePort services
+
+    - name: Set INPUT chain default policy to ACCEPT for inter-node communication
+      ansible.builtin.shell: |
+        iptables -P INPUT ACCEPT
+      changed_when: false
+        
+    - name: Save iptables rules
+      shell: |
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+  when: ansible_os_family == "Debian"
+
+- name: Configure firewalld (RHEL/CentOS/Rocky)  
+  block:
+    - name: Start and enable firewalld
+      systemd:
+        name: firewalld
+        state: started
+        enabled: yes
+        
+    - name: Open Kubernetes ports
+      firewalld:
+        port: "{{ item }}"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      loop:
+        - "22/tcp"       # SSH
+        - "6443/tcp"     # Kubernetes API (VIP)
+        - "6444/tcp"     # Kubernetes API (stacked HA backend)
+        - "10250/tcp"    # kubelet API
+        - "10259/tcp"    # kube-scheduler
+        - "10257/tcp"    # kube-controller-manager
+        - "2379-2380/tcp" # etcd
+        - "30000-32767/tcp" # NodePort services
+        
+    - name: Open HAProxy stats port
+      firewalld:
+        port: "{{ haproxy.stats_port }}/tcp"
+        permanent: yes
+        state: enabled
+        immediate: yes
+      when: inventory_hostname in groups['k8s_load_balancers']
+  when: ansible_os_family == "RedHat"
+
+# =======================================================  
+# Time synchronization
+# =======================================================
+- name: Configure time synchronization (Debian/Ubuntu)
+  block:
+    - name: Check if systemd-timesyncd is available
+      command: systemctl status systemd-timesyncd
+      register: timesyncd_status
+      failed_when: false
+      changed_when: false
+      
+    - name: Use systemd-timesyncd if available (modern Debian/Ubuntu)
+      systemd:
+        name: systemd-timesyncd
+        state: started
+        enabled: yes
+      when: timesyncd_status.rc == 0
+      
+    - name: Install chrony if systemd-timesyncd not available
+      apt:
+        name: chrony
+        state: present
+      when: timesyncd_status.rc != 0
+      
+    - name: Start and enable chrony
+      systemd:
+        name: chrony
+        state: started
+        enabled: yes
+      when: timesyncd_status.rc != 0
+  when: ansible_os_family == "Debian"
+
+- name: Configure time synchronization (RHEL/CentOS/Rocky)
+  block:
+    - name: Install chrony
+      yum:
+        name: chrony
+        state: present
+        
+    - name: Start and enable chronyd
+      systemd:
+        name: chronyd
+        state: started
+        enabled: yes
+  when: ansible_os_family == "RedHat"

@@ -1,0 +1,69 @@
+all:
+  vars:
+    ansible_user: djuma
+    ansible_python_interpreter: /usr/bin/python3
+    
+    # Cluster Configuration
+    k8s_cluster_name: "k8s-ha-cluster"
+    k8s_version: "1.33.0"
+    
+    # CRITICAL FOR STACKED HA:
+    # - HAProxy runs as STATIC POD on each control plane
+    # - HAProxy listens on VIP:6443 (frontend)
+    # - HAProxy forwards to localhost:6444 (backend - API server on DIFFERENT port)
+    # - API server binds to 6444 (to avoid conflict with HAProxy on same host)
+    haproxy_frontend_port: 6443         # VIP external access
+    kube_api_bind_port: 6444            # API server local bind port
+    haproxy_backend_target_port: 6444   # HAProxy targets local API on 6444
+    
+    # Health check settings
+    haproxy_check_interval: "3s"
+    haproxy_rise_count: 2
+    haproxy_fall_count: 3
+
+    # HA Configuration
+    k8s_vip: "192.168.102.80"
+    k8s_vip_interface: "ens192"
+    
+    # Load Balancer Stats
+    haproxy_stats_port: 8404
+    haproxy_stats_user: "admin"
+    haproxy_stats_pass: "admin123"
+    
+    # Networking
+    pod_network_cidr: "10.244.0.0/16"
+    service_subnet: "10.96.0.0/12"
+    
+  children:
+    # Control Plane Nodes (also act as load balancers in stacked setup)
+    k8s_control_plane:
+      hosts:
+        master-app01:
+          ansible_host: 192.168.102.91
+          first_control_plane: true
+          keepalived_priority: 110
+          keepalived_state: "MASTER"
+        master-app02:
+          ansible_host: 192.168.102.92
+          keepalived_priority: 100
+          keepalived_state: "BACKUP"
+    
+    # Load Balancers = Control Plane (stacked setup)
+    k8s_load_balancers:
+      children:
+        k8s_control_plane:
+          
+    # Worker Nodes (currently empty)
+    k8s_workers:
+      hosts:
+        # Uncomment when you have workers:
+        # worker-01:
+        #   ansible_host: 192.168.102.101
+        # worker-02:
+        #   ansible_host: 192.168.102.102
+          
+    # All cluster nodes
+    k8s_cluster:
+      children:
+        k8s_control_plane:
+        k8s_workers:

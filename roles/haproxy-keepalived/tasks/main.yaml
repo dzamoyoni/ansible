@@ -1,0 +1,118 @@
+---
+# ================================================================
+# HAProxy + Keepalived HA Load Balancer Setup (Static Pods)
+# Role: haproxy-keepalived
+# ================================================================
+
+# ---
+## Prerequisites Check
+- name: Check if running on designated load balancers
+  ansible.builtin.fail:
+    msg: "HAProxy/Keepalived role must only be applied to nodes in the 'k8s_load_balancers' group."
+  when: inventory_hostname not in groups['k8s_load_balancers']
+
+- name: Verify port configuration for stacked HA
+  ansible.builtin.assert:
+    that:
+      # kube_api_bind_port (6444) MUST be different from haproxy_frontend_port (6443)
+      - kube_api_bind_port | int != haproxy_frontend_port | int
+    fail_msg: |
+      CRITICAL: Invalid port configuration for stacked HA! HAProxy ({{ haproxy_frontend_port }}) and 
+      API Server ({{ kube_api_bind_port }}) MUST use different ports on the same host.
+    success_msg: "✓ Port configuration valid for stacked HA (6443 vs 6444)"
+
+# ---
+## Stop System Services (We use static pods instead)
+- name: Stop and disable system HAProxy and Keepalived services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - haproxy
+    - keepalived
+  ignore_errors: true # Ignore if the service doesn't exist
+
+# ---
+## Create Configuration Directories
+- name: Create static pods and configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  loop:
+    - /etc/kubernetes/manifests
+    - /etc/haproxy-k8s
+    - /etc/keepalived-k8s
+    - /var/lib/haproxy
+
+# ---
+## Enable Required Sysctl Settings for VIP
+- name: Enable non-local bind for VIP (CRITICAL for Keepalived)
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_nonlocal_bind
+    value: '1'
+    state: present
+    sysctl_set: yes
+    reload: yes
+
+# ---
+## Generate Configuration Files and Manifests
+- name: Generate HAProxy configuration for stacked HA
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy-k8s/haproxy.cfg
+    mode: '0644'
+    owner: root
+    group: root
+    # Use validation if haproxy is already installed as a package
+    validate: 'haproxy -c -f %s'
+  ignore_errors: true
+
+- name: Generate Keepalived configuration
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived-k8s/keepalived.conf
+    mode: '0644'
+    owner: root
+    group: root
+
+# ---
+## Create Health Check Script (needed by Keepalived)
+- name: Create Keepalived notify script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      # Simple script to log state changes (required by keepalived.conf.j2)
+      TYPE=$1
+      echo "Keepalived state change on {{ inventory_hostname }}: $TYPE" >> /var/log/keepalived_state.log
+      exit 0
+    dest: /usr/local/bin/keepalived-notify.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+# ---
+## Create Static Pod Manifests
+- name: Create HAProxy static pod manifest
+  ansible.builtin.template:
+    src: haproxy-static-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/haproxy.yaml
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Create Keepalived static pod manifest
+  ansible.builtin.template:
+    src: keepalived-static-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/keepalived.yaml
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Display static pod deployment status reminder
+  ansible.builtin.debug:
+    msg: "Static pod manifests deployed. Kubelet will start them after initialization."
+    

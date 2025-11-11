@@ -1,0 +1,84 @@
+# -----------------------------------------------------------------------------
+# Kubernetes Kubeadm Configuration - v1beta4 (ACTUAL CORRECT FORMAT)
+# CRITICAL: In v1beta4, extraArgs is a LIST of {name, value} objects!
+# -----------------------------------------------------------------------------
+
+{# Decide controlPlaneEndpoint dynamically:
+   - first_control_plane (inventory var true) -> init uses localIP:kube_api_bind_port
+   - other nodes -> use VIP:haproxy_frontend_port (HAProxy will be the external endpoint)
+#}
+{% set cp_endpoint = (ansible_default_ipv4.address ~ ':' ~ (kube_api_bind_port|string))
+                     if (first_control_plane | default(false))
+                     else (k8s_vip ~ ':' ~ (haproxy_frontend_port|string)) %}
+
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: ClusterConfiguration
+kubernetesVersion: v{{ k8s_version | default('1.33.0') }}
+clusterName: {{ k8s_cluster_name }}
+controlPlaneEndpoint: "{{ cp_endpoint }}"
+networking:
+  serviceSubnet: {{ service_subnet }}
+  podSubnet: {{ pod_network_cidr }}
+  dnsDomain: cluster.local
+
+apiServer:
+  certSANs:
+{% for san in cert_sans_list %}
+    - {{ san }}
+{% endfor %}
+  extraArgs:
+    - name: bind-address
+      value: "0.0.0.0"
+    - name: secure-port
+      value: "{{ kube_api_bind_port | string }}"
+    - name: audit-log-maxage
+      value: "30"
+    - name: audit-log-maxbackup
+      value: "10"
+    - name: audit-log-maxsize
+      value: "100"
+    - name: audit-log-path
+      value: "/var/log/audit.log"
+    - name: enable-admission-plugins
+      value: "NodeRestriction,LimitRanger,ServiceAccount,DefaultStorageClass,DefaultTolerationSeconds,MutatingAdmissionWebhook,ValidatingAdmissionWebhook,ResourceQuota"
+    - name: profiling
+      value: "false"
+    - name: request-timeout
+      value: "300s"
+
+controllerManager:
+  extraArgs:
+    - name: profiling
+      value: "false"
+    - name: bind-address
+      value: "0.0.0.0"
+
+scheduler:
+  extraArgs:
+    - name: profiling
+      value: "false"
+    - name: bind-address
+      value: "0.0.0.0"
+
+etcd:
+  local:
+    dataDir: /var/lib/etcd
+
+---
+apiVersion: kubeadm.k8s.io/v1beta4
+kind: InitConfiguration
+nodeRegistration:
+  criSocket: unix:///var/run/cri-dockerd.sock
+  ignorePreflightErrors:
+    - NumCPU
+    - Mem
+localAPIEndpoint:
+  advertiseAddress: "{{ ansible_default_ipv4.address }}"
+  bindPort: {{ kube_api_bind_port | int }}
+
+---
+apiVersion: kubeproxy.config.k8s.io/v1alpha1
+kind: KubeProxyConfiguration
+bindAddress: "0.0.0.0"
+mode: "ipvs"
+

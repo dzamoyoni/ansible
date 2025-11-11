@@ -1,0 +1,7 @@
+---
+# Kubernetes variables for RHEL/CentOS/Rocky systems
+
+kubernetes_packages:
+  - kubelet
+  - kubeadm
+  - kubectl

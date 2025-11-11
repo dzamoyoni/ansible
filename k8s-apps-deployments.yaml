@@ -1,0 +1,75 @@
+---
+- name: Deploy application resources to custom namespace
+  hosts: k8s_control_plane
+  become: false
+  gather_facts: false
+
+  vars:
+    app_namespace: qa
+    manifest_base_dir: /home/dennis.juma/ans/k8s
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+    - name: Show current user (on remote host)
+      command: whoami
+      register: whoami_out
+
+    - debug:
+        var: whoami_out.stdout
+
+    - name: Ensure pip is installed (remote)
+      apt:
+        name: python3-pip
+        state: present
+      become: true
+
+    - name: Install Kubernetes client via APT (remote)
+      apt:
+        name: python3-kubernetes
+        state: present
+      become: true
+
+    - name: Create namespace (remote)
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ app_namespace }}"
+
+    - name: Apply secrets (from localhost)
+      delegate_to: localhost
+      shell: kubectl apply -f {{ item }} -n {{ app_namespace }}
+      loop: "{{ lookup('fileglob', manifest_base_dir + '/secrets/*.yaml', wantlist=True) }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') + '/.kube/config' }}"
+
+    - name: Apply configmaps (from localhost)
+      delegate_to: localhost
+      shell: kubectl apply -f {{ item }} -n {{ app_namespace }}
+      loop: "{{ lookup('fileglob', manifest_base_dir + '/configs/*.yaml', wantlist=True) }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') + '/.kube/config' }}"
+
+    - name: Apply deployments (from localhost)
+      delegate_to: localhost
+      shell: kubectl apply -f {{ item }} -n {{ app_namespace }}
+      loop: "{{ lookup('fileglob', manifest_base_dir + '/deploy/*.yaml', wantlist=True) }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') + '/.kube/config' }}"
+
+    - name: Apply services (from localhost)
+      delegate_to: localhost
+      shell: kubectl apply -f {{ item }} -n {{ app_namespace }}
+      loop: "{{ lookup('fileglob', manifest_base_dir + '/services/*.yaml', wantlist=True) }}"
+      loop_control:
+        label: "{{ item | basename }}"
+      environment:
+        KUBECONFIG: "{{ lookup('env','HOME') + '/.kube/config' }}"

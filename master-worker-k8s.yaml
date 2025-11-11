@@ -1,0 +1,662 @@
+---
+# =============================================================================
+# Simple Kubernetes Cluster Deployment (Non-HA)
+# Supports: Ubuntu, Debian, RHEL, CentOS, Rocky Linux
+# Components: Docker, cri-dockerd, Kubernetes
+# =============================================================================
+
+- name: Record start time
+  hosts: localhost
+  gather_facts: yes
+  tasks:
+    - name: Record playbook start time
+      set_fact:
+        playbook_start_time: "{{ ansible_date_time.epoch }}"
+        playbook_start_iso: "{{ ansible_date_time.iso8601 }}"
+
+# =============================================================================
+# Phase 1: Pre-flight Checks and System Preparation
+# =============================================================================
+- name: Phase 1 - Pre-flight checks and validation
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Display deployment information
+      debug:
+        msg:
+          - "=== Simple Kubernetes Cluster Deployment ==="
+          - "Control Plane: {{ groups['k8s_control_plane'] | join(', ') }}"
+          - "Workers: {{ groups.get('k8s_workers', []) | join(', ') }}"
+          - "Target Node: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Architecture: {{ ansible_architecture }}"
+      
+    - name: Check if Kubernetes is already installed
+      command: kubectl version --client
+      register: k8s_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Check if Docker is already installed
+      command: docker --version
+      register: docker_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Display installation status
+      debug:
+        msg:
+          - "Kubernetes: {{ 'Already installed' if k8s_check.rc == 0 else 'Will be installed' }}"
+          - "Docker: {{ 'Already installed' if docker_check.rc == 0 else 'Will be installed' }}"
+    
+    - name: Validate minimum requirements
+      assert:
+        that:
+          - groups['k8s_control_plane'] | length >= 1
+          - ansible_memtotal_mb >= 1800
+        fail_msg: "Minimum requirements not met. Need at least 1 control plane and 2GB RAM"
+        success_msg: "Pre-flight checks passed"
+
+# =============================================================================
+# Phase 2: System Configuration (All Nodes)
+# =============================================================================
+- name: Phase 2 - System configuration and prerequisites
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check current swap status
+      command: swapon --show
+      register: swap_status
+      failed_when: false
+      changed_when: false
+      
+    - name: Disable swap if enabled
+      block:
+        - name: Turn off swap immediately
+          command: swapoff -a
+          when: swap_status.stdout != ""
+          
+        - name: Comment out swap in /etc/fstab
+          replace:
+            path: /etc/fstab
+            regexp: '^([^#].*?\sswap\s+.*)$'
+            replace: '# \1'
+            backup: yes
+      when: swap_status.stdout != ""
+      
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+      ignore_errors: yes
+      
+    - name: Make kernel modules persistent
+      copy:
+        content: |
+          overlay
+          br_netfilter
+        dest: /etc/modules-load.d/k8s.conf
+        mode: '0644'
+        
+    - name: Configure sysctl for Kubernetes
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        sysctl_file: /etc/sysctl.d/k8s.conf
+        reload: yes
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+      ignore_errors: yes
+
+# =============================================================================
+# Phase 3: Install Docker and Container Runtime
+# =============================================================================
+- name: Phase 3 - Install Docker and cri-dockerd
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if Docker is already installed
+      command: docker --version
+      register: docker_installed
+      failed_when: false
+      changed_when: false
+      
+    - name: Check if cri-dockerd is already installed
+      command: which cri-dockerd
+      register: cri_dockerd_installed
+      failed_when: false
+      changed_when: false
+      
+    - name: Display Docker installation status
+      debug:
+        msg: "Docker: {{ 'Already installed - Skipping' if docker_installed.rc == 0 else 'Installing' }}"
+    
+    # ========================================
+    # Debian/Ubuntu Installation
+    # ========================================
+    - name: Install Docker on Debian/Ubuntu
+      block:
+        - name: Install prerequisites
+          apt:
+            name:
+              - ca-certificates
+              - curl
+              - gnupg
+              - lsb-release
+            state: present
+            update_cache: yes
+            
+        - name: Create Docker keyring directory
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+            
+        - name: Download Docker GPG key
+          get_url:
+            url: "https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }}/gpg"
+            dest: /etc/apt/keyrings/docker.asc
+            mode: '0644'
+            force: yes
+            
+        - name: Add Docker APT repository
+          copy:
+            dest: /etc/apt/sources.list.d/docker.list
+            content: |
+              deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/{{ ansible_facts['distribution'] | lower }} {{ ansible_lsb.codename }} stable
+            mode: '0644'
+          register: docker_repo_added
+          
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+          when: docker_repo_added.changed
+          
+        - name: Install Docker packages
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+      when: 
+        - ansible_os_family == "Debian"
+        - docker_installed.rc != 0
+    
+    # ========================================
+    # RHEL/CentOS/Rocky Installation
+    # ========================================
+    - name: Install Docker on RHEL/CentOS/Rocky
+      block:
+        - name: Install prerequisites
+          yum:
+            name:
+              - yum-utils
+              - device-mapper-persistent-data
+              - lvm2
+            state: present
+            
+        - name: Add Docker CE repository
+          yum_repository:
+            name: docker-ce-stable
+            description: Docker CE Stable
+            baseurl: "https://download.docker.com/linux/centos/{{ ansible_distribution_major_version }}/$basearch/stable"
+            enabled: yes
+            gpgcheck: yes
+            gpgkey: https://download.docker.com/linux/centos/gpg
+            
+        - name: Install Docker packages
+          yum:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+              - docker-buildx-plugin
+              - docker-compose-plugin
+            state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - docker_installed.rc != 0
+    
+    # ========================================
+    # Configure containerd
+    # ========================================
+    - name: Configure containerd
+      block:
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+            mode: '0755'
+            
+        - name: Check if containerd config exists
+          stat:
+            path: /etc/containerd/config.toml
+          register: containerd_config
+          
+        - name: Generate default containerd config
+          shell: containerd config default > /etc/containerd/config.toml
+          when: not containerd_config.stat.exists
+          
+        - name: Set containerd cgroup driver to systemd
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup = false'
+            replace: 'SystemdCgroup = true'
+          register: containerd_config_changed
+      when: docker_installed.rc != 0
+    
+    # ========================================
+    # Configure Docker daemon
+    # ========================================
+    - name: Configure Docker daemon
+      copy:
+        content: |
+          {
+            "exec-opts": ["native.cgroupdriver=systemd"],
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "100m",
+              "max-file": "3"
+            },
+            "storage-driver": "overlay2"
+          }
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+      register: docker_daemon_config
+      when: docker_installed.rc != 0
+    
+    # ========================================
+    # Start Docker services
+    # ========================================
+    - name: Start and enable Docker services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: "{{ 'restarted' if (containerd_config_changed.changed or docker_daemon_config.changed) else 'started' }}"
+        daemon_reload: yes
+      loop:
+        - containerd
+        - docker
+      when: docker_installed.rc != 0
+    
+    # ========================================
+    # Install cri-dockerd
+    # ========================================
+    - name: Install cri-dockerd (Debian/Ubuntu)
+      block:
+        - name: Download cri-dockerd deb package
+          get_url:
+            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.17/cri-dockerd_0.3.17.3-0.debian-bookworm_amd64.deb"
+            dest: /tmp/cri-dockerd.deb
+            mode: '0644'
+            
+        - name: Install cri-dockerd package
+          apt:
+            deb: /tmp/cri-dockerd.deb
+      when: 
+        - ansible_os_family == "Debian"
+        - cri_dockerd_installed.rc != 0
+    
+    - name: Install cri-dockerd (RHEL/CentOS/Rocky)
+      block:
+        - name: Download cri-dockerd rpm package
+          get_url:
+            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v0.3.17/cri-dockerd-0.3.17-3.el8.x86_64.rpm"
+            dest: /tmp/cri-dockerd.rpm
+            mode: '0644'
+            
+        - name: Install cri-dockerd package
+          yum:
+            name: /tmp/cri-dockerd.rpm
+            state: present
+      when: 
+        - ansible_os_family == "RedHat"
+        - cri_dockerd_installed.rc != 0
+    
+    - name: Start and enable cri-docker service
+      systemd:
+        name: cri-docker
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      when: cri_dockerd_installed.rc != 0
+    
+    - name: Add user to docker group
+      user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+      when: ansible_user != 'root'
+    
+    - name: Verify Docker installation
+      command: docker run --rm hello-world
+      register: docker_test
+      changed_when: false
+      when: docker_installed.rc != 0
+      
+    - name: Display Docker verification result
+      debug:
+        msg: "✓ Docker verified successfully"
+      when: 
+        - docker_test is defined
+        - docker_test.rc is defined
+        - docker_test.rc == 0
+
+# =============================================================================
+# Phase 4: Install Kubernetes Components
+# =============================================================================
+- name: Phase 4 - Install Kubernetes components
+  hosts: k8s_control_plane:k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if Kubernetes is already installed
+      command: kubelet --version
+      register: kubelet_check
+      failed_when: false
+      changed_when: false
+      
+    - name: Display Kubernetes installation status
+      debug:
+        msg: "Kubernetes: {{ 'Already installed - Skipping' if kubelet_check.rc == 0 else 'Installing' }}"
+    
+    # ========================================
+    # Debian/Ubuntu Installation
+    # ========================================
+    - name: Install Kubernetes on Debian/Ubuntu
+      block:
+        - name: Create Kubernetes keyring directory
+          file:
+            path: /etc/apt/keyrings
+            state: directory
+            mode: '0755'
+            
+        - name: Download Kubernetes GPG key
+          shell: |
+            curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.33/deb/Release.key | 
+            gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+          args:
+            creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+            
+        - name: Set permissions on keyring
+          file:
+            path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+            mode: '0644'
+            
+        - name: Add Kubernetes apt repository
+          copy:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            content: |
+              deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.33/deb/ /
+            mode: '0644'
+          register: k8s_repo_added
+          
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+          when: k8s_repo_added.changed
+          
+        - name: Install Kubernetes packages
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+            
+        - name: Hold Kubernetes packages
+          command: apt-mark hold {{ item }}
+          loop:
+            - kubelet
+            - kubeadm
+            - kubectl
+      when: 
+        - ansible_os_family == "Debian"
+        - kubelet_check.rc != 0
+    
+    # ========================================
+    # RHEL/CentOS/Rocky Installation
+    # ========================================
+    - name: Install Kubernetes on RHEL/CentOS/Rocky
+      block:
+        - name: Add Kubernetes YUM repository
+          yum_repository:
+            name: kubernetes
+            description: Kubernetes
+            baseurl: "https://pkgs.k8s.io/core:/stable:/v1.33/rpm/"
+            enabled: yes
+            gpgcheck: yes
+            gpgkey: "https://pkgs.k8s.io/core:/stable:/v1.33/rpm/repodata/repomd.xml.key"
+            repo_gpgcheck: yes
+            
+        - name: Install Kubernetes packages
+          yum:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+            disable_excludes: kubernetes
+      when: 
+        - ansible_os_family == "RedHat"
+        - kubelet_check.rc != 0
+    
+    # ========================================
+    # Configure kubelet
+    # ========================================
+    - name: Ensure /etc/default directory exists
+      file:
+        path: /etc/default
+        state: directory
+        mode: '0755'
+    
+    - name: Configure kubelet for cri-dockerd
+      copy:
+        content: |
+          KUBELET_EXTRA_ARGS="--container-runtime-endpoint=unix:///var/run/cri-dockerd.sock"
+        dest: /etc/default/kubelet
+        mode: '0644'
+      register: kubelet_config_updated
+    
+    - name: Create kubelet systemd drop-in directory
+      file:
+        path: /etc/systemd/system/kubelet.service.d
+        state: directory
+        mode: '0755'
+    
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+    
+    - name: Enable kubelet service (don't start yet - kubeadm will start it)
+      systemd:
+        name: kubelet
+        enabled: yes
+    
+    - name: Stop kubelet if running (let kubeadm start it fresh)
+      systemd:
+        name: kubelet
+        state: stopped
+      ignore_errors: yes
+
+# =============================================================================
+# Phase 5: Initialize Control Plane
+# =============================================================================
+- name: Phase 5 - Initialize Kubernetes control plane
+  hosts: k8s_control_plane
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if cluster is already initialized
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: cluster_initialized
+      
+    - name: Display initialization status
+      debug:
+        msg: "Cluster: {{ 'Already initialized - Skipping' if cluster_initialized.stat.exists else 'Initializing' }}"
+    
+    - name: Initialize Kubernetes control plane
+      command: >
+        kubeadm init
+        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        --pod-network-cidr=10.0.0.0/16
+        --cri-socket=unix:///var/run/cri-dockerd.sock
+      register: kubeadm_init
+      when: not cluster_initialized.stat.exists
+      
+    - name: Setup kubectl for user
+      block:
+        - name: Create .kube directory
+          file:
+            path: /home/{{ ansible_user }}/.kube
+            state: directory
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0755'
+            
+        - name: Copy admin.conf to user's kube config
+          copy:
+            src: /etc/kubernetes/admin.conf
+            dest: /home/{{ ansible_user }}/.kube/config
+            owner: "{{ ansible_user }}"
+            group: "{{ ansible_user }}"
+            mode: '0600'
+            remote_src: yes
+      when: not cluster_initialized.stat.exists or kubeadm_init.changed
+    
+    - name: Install Calico CNI
+      shell: |
+        kubectl apply --validate=false -f https://docs.projectcalico.org/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      when: not cluster_initialized.stat.exists
+      register: cni_install
+      retries: 3
+      delay: 10
+      until: cni_install.rc == 0
+      
+    - name: Wait for control plane to be ready
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      register: nodes_ready
+      until: nodes_ready.stdout.find("NotReady") == -1
+      retries: 30
+      delay: 10
+      when: not cluster_initialized.stat.exists
+
+# =============================================================================
+# Phase 6: Join Worker Nodes
+# =============================================================================
+- name: Phase 6 - Join worker nodes to cluster
+  hosts: k8s_workers
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Check if worker is already joined
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: worker_joined
+      
+    - name: Display worker join status
+      debug:
+        msg: "Worker: {{ 'Already joined - Skipping' if worker_joined.stat.exists else 'Joining cluster' }}"
+    
+    - name: Generate join command
+      command: kubeadm token create --print-join-command
+      register: join_command
+      delegate_to: "{{ groups['k8s_control_plane'][0] }}"
+      run_once: true
+      when: 
+        - not worker_joined.stat.exists
+        - groups.get('k8s_workers', []) | length > 0
+      
+    - name: Join worker to cluster
+      shell: "{{ join_command.stdout }} --cri-socket=unix:///var/run/cri-dockerd.sock"
+      when: 
+        - not worker_joined.stat.exists
+        - join_command.stdout is defined
+      register: join_result
+
+# =============================================================================
+# Phase 7: Verification and Summary
+# =============================================================================
+- name: Phase 7 - Cluster verification and summary
+  hosts: k8s_control_plane[0]
+  become: true
+  gather_facts: yes
+  
+  tasks:
+    - name: Wait for all nodes to be ready
+      command: kubectl get nodes --no-headers
+      register: nodes_status
+      until: nodes_status.stdout.find("NotReady") == -1
+      retries: 30
+      delay: 10
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+        
+    - name: Get cluster status
+      shell: |
+        echo "=== Cluster Information ==="
+        kubectl cluster-info
+        echo ""
+        echo "=== Node Status ==="
+        kubectl get nodes -o wide
+        echo ""
+        echo "=== System Pods ==="
+        kubectl get pods -n kube-system
+      register: cluster_status
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+        
+    - name: Display cluster status
+      debug:
+        msg: "{{ cluster_status.stdout_lines }}"
+        
+    - name: Calculate execution time
+      set_fact:
+        playbook_end_time: "{{ ansible_date_time.epoch }}"
+        execution_seconds: "{{ ansible_date_time.epoch | int - hostvars['localhost']['playbook_start_time'] | int }}"
+        
+    - name: Format execution time
+      set_fact:
+        execution_minutes: "{{ (execution_seconds | int / 60) | int }}"
+        execution_remaining_seconds: "{{ execution_seconds | int % 60 }}"
+    
+    - name: Display deployment completion
+      debug:
+        msg:
+          - " Simple Kubernetes Cluster Deployment COMPLETED! "
+          - ""
+          - " Execution Time: {{ execution_minutes }}m {{ execution_remaining_seconds }}s"
+          - " Started:  {{ hostvars['localhost']['playbook_start_iso'] }}"
+          - " Finished: {{ ansible_date_time.iso8601 }}"
+          - ""
+          - " Control Plane: {{ groups['k8s_control_plane'] | join(', ') }}"
+          - " Workers: {{ groups.get('k8s_workers', ['None']) | join(', ') }}"
+          - " CNI: Calico"
+          - ""
+          - " Next steps:"
+          - "   1. Copy kubeconfig: scp {{ ansible_user }}@{{ ansible_host }}:~/.kube/config ~/.kube/config"
+          - "   2. Test cluster: kubectl get nodes"
+          - "   3. Deploy applications"

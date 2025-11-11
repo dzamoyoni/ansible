@@ -1,0 +1,180 @@
+---
+# ================================================================
+# HAProxy + Keepalived HA Load Balancer Setup (Static Pods)
+# Note: Replaced 'ignore_errors: yes' with precise 'failed_when' logic.
+# ================================================================
+
+- name: Set OS-specific variables
+  ansible.builtin.include_vars: "{{ ansible_os_family | lower }}.yaml"
+
+# ---
+## Prerequisites Check
+- name: Check if running on designated load balancers
+  ansible.builtin.fail:
+    msg: "HAProxy/Keepalived role must only be applied to nodes in the 'k8s_load_balancers' group."
+  when: inventory_hostname not in groups['k8s_load_balancers']
+
+- name: Check if virtual IP is reachable
+  ansible.builtin.command: ping -c 1 {{ k8s_vip }}
+  register: vip_ping
+  failed_when: false
+  changed_when: false
+
+- name: Display VIP status
+  ansible.builtin.debug:
+    msg: "Virtual IP {{ k8s_vip }} is {{ 'already in use' if vip_ping.rc == 0 else 'available' }}"
+
+# ---
+## Install HAProxy and Keepalived
+- name: Install HAProxy and Keepalived (Debian/Ubuntu)
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - keepalived
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "Debian"
+
+- name: Install HAProxy and Keepalived (RHEL/CentOS/Rocky)
+  ansible.builtin.yum:
+    name:
+      - haproxy
+      - keepalived
+    state: present
+    update_cache: yes
+  when: ansible_os_family == "RedHat"
+
+# ---
+## Stop System Services (Using Explicit failed_when)
+- name: Stop and disable system HAProxy and Keepalived services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: no
+  loop:
+    - haproxy
+    - keepalived
+  register: service_stop_result
+  # FIX: Fail only if the service fails to stop and the failure is NOT due to the service being missing.
+  failed_when: service_stop_result.failed and 'not-found' not in service_stop_result.msg
+
+# ---
+## Create Configuration Directories
+- name: Create static pods and configuration directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: '0755'
+    owner: root
+    group: root
+  loop:
+    - /etc/kubernetes/manifests
+    - /etc/haproxy-k8s
+    - /etc/keepalived-k8s
+
+# ---
+## Generate Configurations and Manifests
+- name: Generate HAProxy configuration
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy-k8s/haproxy.cfg
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Generate Keepalived configuration
+  ansible.builtin.template:
+    src: keepalived.conf.j2
+    dest: /etc/keepalived-k8s/keepalived.conf
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Create HAProxy static pod manifest
+  ansible.builtin.template:
+    src: haproxy-static-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/haproxy.yaml
+    mode: '0644'
+    owner: root
+    group: root
+
+- name: Create Keepalived static pod manifest
+  ansible.builtin.template:
+    src: keepalived-static-pod.yaml.j2
+    dest: /etc/kubernetes/manifests/keepalived.yaml
+    mode: '0644'
+    owner: root
+    group: root
+
+# ---
+## Health Check Script and Validation Display
+- name: Create HAProxy health check script
+  ansible.builtin.copy:
+    content: |
+      #!/bin/bash
+      # HAProxy + Keepalived Health Check Script
+      
+      VIP="{{ k8s_vip }}"
+      PORT="{{ haproxy_bind_port | default(6443) }}"
+      
+      echo "=== HA Load Balancer Health Check ==="
+      echo "Date: $(date)"
+      echo
+      
+      # Check if VIP is assigned
+      if ip addr show dev {{ k8s_vip_interface }} | grep -q "$VIP"; then
+        echo "✓ Virtual IP $VIP is assigned to this node on {{ k8s_vip_interface }}"
+      else
+        echo "✗ Virtual IP $VIP is NOT assigned to this node"
+      fi
+      
+      # Check HAProxy process
+      if pgrep -f "haproxy.*k8s" > /dev/null; then
+        echo "✓ HAProxy process is running"
+      else
+        echo "✗ HAProxy process is NOT running"
+      fi
+      
+      # Check Keepalived process
+      if pgrep keepalived > /dev/null; then
+        echo "✓ Keepalived process is running"
+      else
+        echo "✗ Keepalived process is NOT running"
+      fi
+      
+      # Check port binding (API Server Port)
+      if netstat -ln | grep -q ":$PORT"; then
+        echo "✓ Port $PORT (API) is listening"
+      else
+        echo "✗ Port $PORT (API) is NOT listening"
+      fi
+      
+      # Test connection to VIP
+      if timeout 3 bash -c "echo >/dev/tcp/$VIP/$PORT" 2>/dev/null; then
+        echo "✓ Connection to $VIP:$PORT successful"
+      else
+        echo "✗ Connection to $VIP:$PORT failed"
+      fi
+      
+      echo
+      echo "=== Static Pod Status ==="
+      if command -v kubectl > /dev/null 2>&1; then
+        kubectl get pods -n kube-system | grep -E "(haproxy|keepalived)" || echo "No HA static pods found (Waiting for Kubelet)"
+      else
+        echo "kubectl not available (Waiting for Kubelet)"
+      fi
+    dest: /usr/local/bin/ha-lb-check.sh
+    mode: '0755'
+    owner: root
+    group: root
+
+- name: Display load balancer endpoints
+  ansible.builtin.debug:
+    msg:
+      - "HA Load Balancer Configuration Complete"
+      - "Virtual IP: {{ k8s_vip }}"
+      - "HAProxy bind port (K8s API): {{ haproxy.bind_port }}" 
+      - "HAProxy stats: http://{{ ansible_default_ipv4.address }}:{{ haproxy.stats_port | default(8404) }}"
+      - "Stats credentials: {{ haproxy.stats_user | default('admin') }} / (hidden)"
+      - "Keepalived state: {{ keepalived_state }}"
+      - "Keepalived priority: {{ keepalived_priority }}"
