@@ -42,7 +42,7 @@ vrrp_instance VI_{{ keepalived_router_id | default('51') }} {
     }
     
     virtual_ipaddress {
-        {{ k8s_vip }}/{{ k8s_vip_netmask | default('24') }}
+        {{ k8s_vip }}/{{ k8s_vip_netmask | default('32') }}
     }
     
     track_script {

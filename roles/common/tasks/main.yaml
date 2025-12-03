@@ -169,6 +169,8 @@
         jump: ACCEPT
         comment: "Allow Kubernetes {{ item }}"
       loop:
+        - '8200'
+        - '8201'      # hashicorp vault
         - '6443'      # API server (VIP)
         - '6444'      # API server (stacked HA backend)
         - '10250'     # kubelet

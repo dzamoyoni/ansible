@@ -41,7 +41,7 @@ vrrp_instance {{ keepalived.vrrp_instance_name }} {
 {% endfor %}
     }
     virtual_ipaddress {
-        {{ k8s_vip }}
+        {{ k8s_vip }}/32
     }
     track_script {
         chk_apiserver
