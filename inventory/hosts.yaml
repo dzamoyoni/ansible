@@ -8,13 +8,13 @@ all:
     k8s_control_plane:
       hosts:
         app01:
-          ansible_host: 10.164.80.70
-    k8s_workers:
-      hosts:
-        app02:
-          ansible_host: 10.164.80.71
-        app03:
-          ansible_host: 10.164.80.72
+          ansible_host: 192.168.102.157
+    # k8s_workers:
+    #   hosts:
+    #     app02:
+    #       ansible_host: 172.28.30.60
+    #     app03:
+    #       ansible_host: 172.28.30.22
 
           
     k8s_nodes:

@@ -504,10 +504,46 @@
   gather_facts: yes
   
   tasks:
+    - name: Determine the correct advertise IP for this node
+      ansible.builtin.set_fact:
+        k8s_advertise_ip: "{{ hostvars[inventory_hostname].get('k8s_apiserver_ip') | default(ansible_host, true) }}"
+
+    - name: Verify the advertise IP actually exists on this node
+      ansible.builtin.fail:
+        msg: >
+          {{ k8s_advertise_ip }} (from inventory ansible_host) is not present on any
+          interface of {{ inventory_hostname }}. Interfaces found:
+          {{ ansible_all_ipv4_addresses }}. Fix the inventory entry or set
+          k8s_apiserver_ip explicitly in host_vars for this node.
+      when: k8s_advertise_ip not in ansible_all_ipv4_addresses
+
+    - name: Display selected advertise IP
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} will bootstrap using {{ k8s_advertise_ip }}"
+
     - name: Check if cluster is already initialized
       stat:
         path: /etc/kubernetes/admin.conf
       register: cluster_initialized
+
+    - name: If already initialized, verify it's advertising the expected endpoint
+      block:
+        - name: Read current admin.conf server address
+          shell: >
+            grep -oP '(?<=server: https://)[^:]+' /etc/kubernetes/admin.conf
+          register: current_advertise_ip
+          changed_when: false
+
+        - name: Fail if existing cluster config doesn't match expected IP/VIP
+          ansible.builtin.fail:
+            msg: >
+              Existing /etc/kubernetes/admin.conf advertises
+              {{ current_advertise_ip.stdout }}, but expected
+              {{ (k8s_control_plane_endpoint | default(k8s_advertise_ip)).split(':')[0] }}.
+              This looks like leftover state from an incomplete reset.
+              Run the reset playbook fully before re-bootstrapping.
+          when: current_advertise_ip.stdout != (k8s_control_plane_endpoint | default(k8s_advertise_ip)).split(':')[0]
+      when: cluster_initialized.stat.exists
       
     - name: Display initialization status
       debug:
@@ -516,7 +552,8 @@
     - name: Initialize Kubernetes control plane
       command: >
         kubeadm init
-        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        --apiserver-advertise-address={{ k8s_advertise_ip }}
+        --control-plane-endpoint={{ k8s_control_plane_endpoint | default(k8s_advertise_ip) }}
         --pod-network-cidr=10.0.0.0/16
         --cri-socket=unix:///var/run/cri-dockerd.sock
       register: kubeadm_init

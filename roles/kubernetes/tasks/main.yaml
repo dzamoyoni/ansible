@@ -1,6 +1,6 @@
 ---
 # =============================================================================
-# Kubernetes Installation Tasks - FIXED GPG KEY HANDLING
+# Kubernetes Installation Tasks - GPG KEY HANDLING
 # File: roles/kubernetes/tasks/main.yml
 # =============================================================================
 
@@ -26,7 +26,7 @@
   when: ansible_os_family == "Debian"
   tags: ['cleanup']
 
-# 2. Update APT cache FIRST (CRITICAL FIX)
+# 2. Update APT cache FIRST 
 - name: Update APT cache before installing dependencies
   ansible.builtin.apt:
     update_cache: yes
@@ -61,7 +61,7 @@
     mode: '0755'
   when: ansible_os_family == "Debian"
 
-# 5. Download and properly import Kubernetes GPG key (FIXED METHOD)
+# 5. Download and properly import Kubernetes GPG key
 - name: Download Kubernetes GPG key to temporary location
   ansible.builtin.get_url:
     url: "https://pkgs.k8s.io/core:/stable:/v{{ (k8s_version | default('1.33.5')).split('.')[0] }}.{{ (k8s_version | default('1.33.5')).split('.')[1] }}/deb/Release.key"
@@ -194,5 +194,3 @@
       - "✓ Kubeadm installed: {{ kubeadm_ver_check.stdout }}"
   when: kubelet_ver_check is succeeded and kubeadm_ver_check is succeeded
 
-# --- END OF ROLE TASKS ---
-# The old, failing debug block that referenced 'k8s_verify.results' is completely removed.

@@ -1,15 +1,31 @@
 ---
 - name: Reset Kubernetes Cluster
-  hosts: k8s_cluster
+  hosts: k8s_control_plane
   become: true
-  gather_facts: no
+  gather_facts: true   # needed for interface/service facts below
+
   tasks:
+    - name: Drain and delete node (best-effort, only if API is still reachable)
+      ansible.builtin.shell: |
+        kubectl drain {{ inventory_hostname }} --ignore-daemonsets --delete-emptydir-data --force || true
+        kubectl delete node {{ inventory_hostname }} || true
+      environment:
+        KUBECONFIG: /etc/kubernetes/admin.conf
+      failed_when: false
+      changed_when: false
+
     - name: Reset kubeadm
       ansible.builtin.shell: kubeadm reset -f --cri-socket unix:///var/run/cri-dockerd.sock
       register: reset_result
       failed_when: false
 
-    - name: Remove Kubernetes directories
+    - name: Stop kubelet before cleanup
+      ansible.builtin.systemd:
+        name: kubelet
+        state: stopped
+      failed_when: false
+
+    - name: Remove Kubernetes directories and state
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
@@ -18,20 +34,57 @@
         - /var/lib/etcd
         - /var/lib/kubelet
         - /var/lib/haproxy
+        - /var/lib/cni
+        - /etc/cni/net.d
+        - /opt/cni/bin
         - /root/.kube
+        - "/home/{{ ansible_env.SUDO_USER | default('ubuntu') }}/.kube"
+        - /etc/systemd/system/kubelet.service.d
 
-    - name: Restart cri-docker
+    - name: Flush iptables rules left by kube-proxy/calico
+      ansible.builtin.shell: "{{ item }}"
+      loop:
+        - iptables-save | grep -v KUBE | grep -v CALI | grep -v cali | iptables-restore
+        - iptables -F
+        - iptables -X
+        - iptables -t nat -F
+        - iptables -t nat -X
+        - iptables -t mangle -F
+        - iptables -t mangle -X
+      failed_when: false
+      changed_when: false
+
+    - name: Clear ipvs rules if ipvs proxy mode was used
+      ansible.builtin.shell: ipvsadm --clear
+      failed_when: false
+      changed_when: false
+
+    - name: Remove leftover CNI/Calico virtual interfaces
+      ansible.builtin.shell: |
+        for iface in $(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(cni0|flannel|cali|tunl0|vxlan.calico|calico)'); do
+          ip link delete "$iface" 2>/dev/null || true
+        done
+      failed_when: false
+      changed_when: false
+
+    - name: Restart container runtime
       ansible.builtin.systemd:
         name: cri-docker
         state: restarted
-        daemon_reload: yes
+        daemon_reload: true
       failed_when: false
 
-    - name: Restart kubelet
+    - name: Restart containerd/docker (whichever backs cri-dockerd)
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+      failed_when: false
+
+    - name: Reload systemd and restart kubelet
       ansible.builtin.systemd:
         name: kubelet
         state: restarted
-        daemon_reload: yes
+        daemon_reload: true
       failed_when: false
 
     - name: Display reset status
